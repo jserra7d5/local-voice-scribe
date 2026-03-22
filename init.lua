@@ -135,6 +135,29 @@ local function restoreDuckState()
     clearDuckState()
 end
 
+local duckRampTimers = {}
+
+local function rampVolume(appName, fromVol, toVol, duration, callback)
+    if duckRampTimers[appName] then
+        duckRampTimers[appName]:stop()
+        duckRampTimers[appName] = nil
+    end
+    local steps = 10
+    local interval = duration / steps
+    local step = 0
+    duckRampTimers[appName] = hs.timer.doEvery(interval, function(timer)
+        step = step + 1
+        local t = step / steps
+        local vol = fromVol + (toVol - fromVol) * t
+        setAppVolume(appName, vol)
+        if step >= steps then
+            timer:stop()
+            duckRampTimers[appName] = nil
+            if callback then callback() end
+        end
+    end)
+end
+
 local function duckAudio()
     savedVolumes = {}
     local apps = {"Music", "Spotify"}
@@ -143,7 +166,7 @@ local function duckAudio()
             local vol = getAppVolume(appName)
             if vol and vol > 0 then
                 savedVolumes[appName] = vol
-                setAppVolume(appName, vol * (duckLevel / 100))
+                rampVolume(appName, vol, vol * (duckLevel / 100), 0.5)
             end
         end
     end
@@ -155,7 +178,8 @@ end
 local function unduckAudio()
     for appName, vol in pairs(savedVolumes) do
         if isAppRunning(appName) then
-            setAppVolume(appName, vol)
+            local currentVol = getAppVolume(appName) or (vol * (duckLevel / 100))
+            rampVolume(appName, currentVol, vol, 1.0)
         end
     end
     clearDuckState()

@@ -67,20 +67,17 @@ local function flashBorder(colorName)
     local color = borderColors[colorName]
     createBorder(color, 0.9)
 
-    local steps = 12
+    local steps = 11
     local step = 0
     borderFadeTimer = hs.timer.doEvery(0.05, function(timer)
         step = step + 1
-        local alpha = 0.9 * (1 - step / steps)
         if step >= steps or not borderCanvas then
             timer:stop()
             borderFadeTimer = nil
-            if borderCanvas then
-                borderCanvas:delete()
-                borderCanvas = nil
-            end
+            clearBorder()
             return
         end
+        local alpha = 0.9 * (1 - step / steps)
         for i = 1, borderCanvas:elementCount() do
             borderCanvas:elementAttribute(i, "fillColor", {
                 red = color.red, green = color.green, blue = color.blue, alpha = alpha

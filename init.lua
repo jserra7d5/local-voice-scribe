@@ -36,7 +36,6 @@ if not hs.fs.attributes(dictionaryFile) then
     if f then f:close() end
 end
 
-local isRecording = false
 local recordingTask = nil
 local tempAudioFile = "/tmp/whisper_recording.wav"
 local whisperServerPath = "/Users/joeserra/Documents/whisper.cpp/build/bin/whisper-server"
@@ -46,6 +45,10 @@ local stateFile = "/tmp/whisper_state.txt"
 local duckStateFile = "/tmp/whisper_duck_state.txt"
 local logFile = "/tmp/whisper_debug.log"
 local currentState = "idle"
+local sessionId = 0
+local idleResetTimer = nil
+local ffmpegSafetyTimer = nil
+local serverPollTimer = nil
 
 local function log(msg)
     local file = io.open(logFile, "a")
@@ -65,6 +68,7 @@ hs.alert.defaultStyle.atScreenEdge = 1
 -- Border visual effects
 local borderCanvas = nil
 local borderFadeTimer = nil
+local borderGeneration = 0
 
 local borderColors = {
     recording = { red = 1, green = 0.15, blue = 0.15 },
@@ -79,6 +83,7 @@ end
 
 local function createBorder(color, alpha)
     clearBorder()
+    borderGeneration = borderGeneration + 1
     local screen = hs.screen.mainScreen():fullFrame()
     local thickness = 6
     borderCanvas = hs.canvas.new(screen)
@@ -93,19 +98,22 @@ local function createBorder(color, alpha)
         { type = "rectangle", frame = { x = screen.w - thickness, y = 0, w = thickness, h = screen.h }, fillColor = fillColor, strokeColor = noStroke }
     )
     borderCanvas:show()
+    return borderGeneration
 end
 
 local function showBorder(colorName) createBorder(borderColors[colorName], 0.9) end
 
 local function flashBorder(colorName)
     local color = borderColors[colorName]
-    createBorder(color, 0.9)
+    local gen = createBorder(color, 0.9)
     local steps = 11
     local step = 0
     borderFadeTimer = hs.timer.doEvery(0.05, function(timer)
         step = step + 1
-        if step >= steps or not borderCanvas then
-            timer:stop(); borderFadeTimer = nil; clearBorder(); return
+        if step >= steps or gen ~= borderGeneration or not borderCanvas then
+            timer:stop()
+            if gen == borderGeneration then clearBorder() end
+            return
         end
         local alpha = 0.9 * (1 - step / steps)
         for i = 1, borderCanvas:elementCount() do
@@ -152,7 +160,7 @@ end
 
 local duckRampTimers = {}
 
-local function rampVolume(appName, fromVol, toVol, duration)
+local function rampVolume(appName, fromVol, toVol, duration, onComplete)
     if duckRampTimers[appName] then duckRampTimers[appName]:stop(); duckRampTimers[appName] = nil end
     local steps = 10
     local interval = duration / steps
@@ -163,6 +171,7 @@ local function rampVolume(appName, fromVol, toVol, duration)
         if step >= steps then
             setAppVolume(appName, toVol)
             timer:stop(); duckRampTimers[appName] = nil
+            if onComplete then onComplete() end
         end
     end)
 end
@@ -184,17 +193,25 @@ end
 
 local function unduckAudio()
     if not config.duck_enabled then return end
+    local appsToRamp = 0
+    local appsRamped = 0
     for appName, vol in pairs(savedVolumes) do
         if isAppRunning(appName) then
-            rampVolume(appName, getAppVolume(appName) or (vol * (config.duck_level / 100)), vol, config.duck_ramp_up)
+            appsToRamp = appsToRamp + 1
+            rampVolume(appName, getAppVolume(appName) or (vol * (config.duck_level / 100)), vol, config.duck_ramp_up, function()
+                appsRamped = appsRamped + 1
+                if appsRamped >= appsToRamp then
+                    clearDuckState()
+                end
+            end)
         end
     end
-    clearDuckState()
+    if appsToRamp == 0 then clearDuckState() end
 end
 
 restoreDuckState()
 
--- Whisper server — dead simple approach
+-- Whisper server
 local whisperServerTask = nil
 local whisperIdleTimer = nil
 
@@ -217,6 +234,10 @@ local function resetServerIdleTimer()
     whisperIdleTimer = hs.timer.doAfter(config.server_idle_timeout, stopWhisperServer)
 end
 
+local function suspendServerIdleTimer()
+    if whisperIdleTimer then whisperIdleTimer:stop(); whisperIdleTimer = nil end
+end
+
 local function launchServerIfNeeded()
     if isServerUp() then
         log("server already up")
@@ -227,17 +248,15 @@ local function launchServerIfNeeded()
     log("launching new server")
     hs.execute("lsof -ti:" .. whisperServerPort .. " | xargs kill -9 2>/dev/null", true)
 
-    whisperServerTask = hs.task.new(whisperServerPath, function(exitCode)
+    whisperServerTask = hs.task.new("/bin/sh", function(exitCode)
         log("whisper-server exited: " .. tostring(exitCode))
         whisperServerTask = nil
     end, {
-        "-m", modelPath,
-        "-l", "en",
-        "--port", tostring(whisperServerPort),
-        "--host", "127.0.0.1",
+        "-c", whisperServerPath .. " -m " .. modelPath .. " -l en --port " .. tostring(whisperServerPort) .. " --host 127.0.0.1 >/dev/null 2>&1"
     })
     whisperServerTask:start()
     log("server task started")
+    resetServerIdleTimer()
 end
 
 -- Pre-warm on load
@@ -292,6 +311,10 @@ local function loadReplacements()
     return replacements
 end
 
+local function escapeLuaPattern(s)
+    return s:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1")
+end
+
 local function caseInsensitivePattern(pattern)
     local result = pattern:gsub("%a", function(c)
         return "[" .. c:upper() .. c:lower() .. "]"
@@ -302,18 +325,44 @@ end
 local function applyReplacements(text)
     local replacements = loadReplacements()
     for _, r in ipairs(replacements) do
-        text = text:gsub(caseInsensitivePattern(r.wrong), r.right)
+        local ok, result = pcall(function()
+            local pat = caseInsensitivePattern(escapeLuaPattern(r.wrong))
+            local rep = r.right:gsub("%%", "%%%%")
+            return text:gsub(pat, rep)
+        end)
+        if ok then
+            text = result
+        else
+            log("replacement error for '" .. r.wrong .. "': " .. tostring(result))
+        end
     end
     return text
 end
 
+-- Centralized transcription cleanup
+local function finishTranscription(message)
+    if hs.fs.attributes(tempAudioFile) then os.remove(tempAudioFile) end
+    clearBorder()
+    updateState("idle")
+    resetServerIdleTimer()
+    if message then hs.alert.show(message, 3) end
+end
+
 local function startRecording()
-    isRecording = true
+    sessionId = sessionId + 1
+    local gen = sessionId
     updateState("recording")
-    log("startRecording")
+    log("startRecording session=" .. gen)
+
+    -- Cancel any pending idle reset from previous complete state
+    if idleResetTimer then idleResetTimer:stop(); idleResetTimer = nil end
+
+    -- Keep server alive during active work
+    suspendServerIdleTimer()
 
     -- Pre-warm server so it's ready when recording stops
     launchServerIfNeeded()
+    suspendServerIdleTimer() -- launchServerIfNeeded arms it, suspend again
 
     if hs.fs.attributes(tempAudioFile) then os.remove(tempAudioFile) end
 
@@ -322,23 +371,51 @@ local function startRecording()
     hs.alert.show("Recording started")
 
     recordingTask = hs.task.new("/opt/homebrew/bin/ffmpeg", function(exitCode)
-        log("ffmpeg exited: " .. tostring(exitCode))
+        log("ffmpeg exited: " .. tostring(exitCode) .. " session=" .. gen)
+        if gen ~= sessionId then log("ffmpeg callback: stale session, ignoring"); return end
+
+        -- If we're still in recording state, ffmpeg crashed unexpectedly
+        if currentState == "recording" then
+            log("ffmpeg crashed unexpectedly during recording")
+            unduckAudio()
+            finishTranscription("Recording failed (ffmpeg crashed)")
+            return
+        end
+
+        -- Normal exit after SIGINT — trigger transcription
+        if currentState == "transcribing" then
+            if ffmpegSafetyTimer then ffmpegSafetyTimer:stop(); ffmpegSafetyTimer = nil end
+            local tok, terr = pcall(doTranscription, gen)
+            if not tok then
+                log("doTranscription ERROR: " .. tostring(terr))
+                finishTranscription("Transcription error: " .. tostring(terr))
+            end
+        end
     end, {
         "-y", "-f", "avfoundation", "-i", ":default",
         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
         tempAudioFile
     })
+
+    if not recordingTask then
+        log("ERROR: failed to create ffmpeg task")
+        unduckAudio()
+        finishTranscription("Recording failed (could not start ffmpeg)")
+        return
+    end
+
     recordingTask:start()
     log("ffmpeg started pid=" .. tostring(recordingTask:pid()))
 end
 
-local function doTranscription()
+function doTranscription(gen)
+    if gen ~= sessionId then log("doTranscription: stale session, ignoring"); return end
+
     local attrs = hs.fs.attributes(tempAudioFile)
     log("doTranscription: file size=" .. tostring(attrs and attrs.size))
 
     if not attrs or attrs.size < 1000 then
-        hs.alert.show("Recording too short", 3)
-        updateState("idle")
+        finishTranscription("Recording too short")
         return
     end
 
@@ -346,19 +423,20 @@ local function doTranscription()
     if not isServerUp() then
         log("server not up, launching and waiting...")
         launchServerIfNeeded()
+        suspendServerIdleTimer()
         local attempts = 0
-        hs.timer.doEvery(0.5, function(timer)
+        if serverPollTimer then serverPollTimer:stop() end
+        serverPollTimer = hs.timer.doEvery(0.5, function(timer)
+            if gen ~= sessionId then timer:stop(); serverPollTimer = nil; return end
             attempts = attempts + 1
             if isServerUp() then
-                timer:stop()
+                timer:stop(); serverPollTimer = nil
                 log("server came up after " .. attempts .. " polls")
-                doTranscription()
+                doTranscription(gen)
             elseif attempts > 40 then
-                timer:stop()
+                timer:stop(); serverPollTimer = nil
                 log("server failed to start after 40 polls")
-                hs.alert.show("Whisper server failed to start", 3)
-                updateState("idle")
-                clearBorder()
+                finishTranscription("Whisper server failed to start")
             end
         end)
         return
@@ -380,13 +458,14 @@ local function doTranscription()
     table.insert(curlArgs, "http://127.0.0.1:" .. whisperServerPort .. "/inference")
 
     local curlTask = hs.task.new("/usr/bin/curl", function(exitCode, stdOut, stdErr)
+        if gen ~= sessionId then log("curl callback: stale session, ignoring"); return end
+
         log("curl exit=" .. tostring(exitCode))
         log("curl stdout=[" .. tostring(stdOut) .. "]")
         log("curl stderr=[" .. tostring(stdErr) .. "]")
 
         if exitCode ~= 0 or not stdOut or #stdOut == 0 then
-            hs.alert.show("Transcription failed", 3)
-            updateState("idle")
+            finishTranscription("Transcription failed")
             return
         end
 
@@ -405,10 +484,13 @@ local function doTranscription()
             updateState("complete")
             flashBorder("complete")
             hs.alert.show("Copied to clipboard\n\n" .. preview, 5)
-            hs.timer.doAfter(3, function() updateState("idle") end)
+            idleResetTimer = hs.timer.doAfter(3, function()
+                if gen ~= sessionId then return end
+                updateState("idle")
+            end)
         else
-            hs.alert.show("No transcription found", 3)
-            updateState("idle")
+            finishTranscription("No transcription found")
+            return
         end
 
         if hs.fs.attributes(tempAudioFile) then os.remove(tempAudioFile) end
@@ -419,8 +501,14 @@ local function doTranscription()
 end
 
 local function stopRecording()
-    isRecording = false
     log("stopRecording")
+    local gen = sessionId
+
+    -- Update state BEFORE sending SIGINT so ffmpeg callback knows this is intentional
+    unduckAudio()
+    flashBorder("transcribing")
+    updateState("transcribing")
+    hs.alert.show("Recording stopped. Transcribing")
 
     if recordingTask then
         local pid = recordingTask:pid()
@@ -428,30 +516,35 @@ local function stopRecording()
         if pid then
             hs.execute("kill -INT " .. pid, true)
         end
-        recordingTask = nil
     end
 
-    unduckAudio()
-    flashBorder("transcribing")
-    updateState("transcribing")
-    hs.alert.show("Recording stopped. Transcribing")
-
-    -- Give ffmpeg time to finalize wav
-    hs.timer.doAfter(0.7, function()
-        local ok, err = pcall(doTranscription)
+    -- Safety timeout: force-kill ffmpeg if it hasn't exited after 2s
+    ffmpegSafetyTimer = hs.timer.doAfter(2, function()
+        if gen ~= sessionId then return end
+        log("ffmpeg safety timeout — force killing")
+        if recordingTask then
+            local pid = recordingTask:pid()
+            if pid then hs.execute("kill -9 " .. pid, true) end
+            recordingTask = nil
+        end
+        -- Trigger transcription directly since callback may not fire
+        local ok, err = pcall(doTranscription, gen)
         if not ok then
-            log("doTranscription ERROR: " .. tostring(err))
-            hs.alert.show("Transcription error: " .. tostring(err), 5)
-            updateState("idle")
+            log("doTranscription ERROR after safety timeout: " .. tostring(err))
+            finishTranscription("Transcription error: " .. tostring(err))
         end
     end)
 end
 
 function toggleRecording()
-    if isRecording then
+    if currentState == "idle" or currentState == "complete" then
+        -- Cancel pending idle reset if transitioning from complete
+        if idleResetTimer then idleResetTimer:stop(); idleResetTimer = nil end
+        startRecording()
+    elseif currentState == "recording" then
         stopRecording()
     else
-        startRecording()
+        log("ignoring toggle, state=" .. currentState)
     end
 end
 
@@ -460,14 +553,6 @@ local dictWebview = nil
 
 local function closeDictEditor()
     if dictWebview then dictWebview:delete(); dictWebview = nil end
-end
-
-local function readDictionaryRaw()
-    local file = io.open(dictionaryFile, "r")
-    if not file then return "" end
-    local content = file:read("*a")
-    file:close()
-    return content
 end
 
 hs.urlevent.bind("dict-save", function(eventName, params)
@@ -490,6 +575,14 @@ hs.urlevent.bind("dict-cancel", function()
     log("urlevent dict-cancel received")
     closeDictEditor()
 end)
+
+local function readDictionaryRaw()
+    local file = io.open(dictionaryFile, "r")
+    if not file then return "" end
+    local content = file:read("*a")
+    file:close()
+    return content
+end
 
 local function toggleDictionaryEditor()
     log("toggleDictionaryEditor called")
@@ -560,9 +653,15 @@ local function toggleDictionaryEditor()
     dictWebview:level(hs.canvas.windowLevels.floating)
     dictWebview:windowTitle("Whisper Dictionary")
     dictWebview:allowTextEntry(true)
+    dictWebview:deleteOnClose(true)
     dictWebview:html(html)
     dictWebview:bringToFront()
     dictWebview:show()
+
+    -- Handle native close button
+    dictWebview:windowCallback(function(action)
+        if action == "closing" then dictWebview = nil end
+    end)
     end) -- end pcall
     if not ok then
         log("toggleDictionaryEditor ERROR: " .. tostring(err))

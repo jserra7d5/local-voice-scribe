@@ -399,7 +399,14 @@ local function stopRecording()
     hs.alert.show("Recording stopped. Transcribing")
 
     -- Give ffmpeg time to finalize wav
-    hs.timer.doAfter(0.7, doTranscription)
+    hs.timer.doAfter(0.7, function()
+        local ok, err = pcall(doTranscription)
+        if not ok then
+            log("doTranscription ERROR: " .. tostring(err))
+            hs.alert.show("Transcription error: " .. tostring(err), 5)
+            updateState("idle")
+        end
+    end)
 end
 
 function toggleRecording()
@@ -486,7 +493,7 @@ local function toggleDictionaryEditor()
 
     dictWebview = hs.webview.new(rect)
     dictWebview:windowStyle({"titled", "closable", "resizable"})
-    dictWebview:level(hs.drawing.windowLevels.floating)
+    dictWebview:level(hs.canvas.windowLevels.floating)
     dictWebview:title("Whisper Dictionary")
     dictWebview:policyCallback(function(action, wv, url)
         if action == "navigationAction" and url then
@@ -521,7 +528,8 @@ local function toggleDictionaryEditor()
     end)
     dictWebview:html(html)
     dictWebview:show()
-    dictWebview:hswindow():focus()
+    local win = dictWebview:hswindow()
+    if win then win:focus() end
 end
 
 hs.hotkey.bind(config.hotkey_toggle_recording.mods, config.hotkey_toggle_recording.key, toggleRecording)

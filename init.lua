@@ -312,6 +312,9 @@ local function startRecording()
     updateState("recording")
     log("startRecording")
 
+    -- Pre-warm server so it's ready when recording stops
+    launchServerIfNeeded()
+
     if hs.fs.attributes(tempAudioFile) then os.remove(tempAudioFile) end
 
     duckAudio()
@@ -339,9 +342,10 @@ local function doTranscription()
         return
     end
 
-    -- Wait for server, polling with actual HTTP check
+    -- Wait for server, launching if needed
     if not isServerUp() then
-        log("server not up, waiting...")
+        log("server not up, launching and waiting...")
+        launchServerIfNeeded()
         local attempts = 0
         hs.timer.doEvery(0.5, function(timer)
             attempts = attempts + 1
@@ -349,10 +353,12 @@ local function doTranscription()
                 timer:stop()
                 log("server came up after " .. attempts .. " polls")
                 doTranscription()
-            elseif attempts > 20 then
+            elseif attempts > 40 then
                 timer:stop()
-                hs.alert.show("Server not available", 3)
+                log("server failed to start after 40 polls")
+                hs.alert.show("Whisper server failed to start", 3)
                 updateState("idle")
+                clearBorder()
             end
         end)
         return

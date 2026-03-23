@@ -6,7 +6,7 @@ Hammerspoon-based voice recording and transcription tool using whisper.cpp.
 
 - `init.lua` is the main (and only) script
 - Symlinked to `~/.hammerspoon/init.lua`
-- Uses whisper.cpp at `/Users/joeserra/Documents/whisper.cpp/build/bin/whisper-cli`
+- Uses whisper-server at `/Users/joeserra/Documents/whisper.cpp/build/bin/whisper-server` (port 8178)
 - Model: `ggml-large-v3-turbo` at `/Users/joeserra/Documents/whisper.cpp/models/`
 - Requires ffmpeg (`/opt/homebrew/bin/ffmpeg`) for audio capture
 
@@ -14,17 +14,24 @@ Hammerspoon-based voice recording and transcription tool using whisper.cpp.
 
 - **Cmd+Alt+R** toggles recording on/off
 - Records from the system default audio input device via ffmpeg/avfoundation
-- Transcribes with whisper.cpp, copies result to clipboard
-- Exposes an HTTP API on port 8989 (`/state`, `/toggle`)
+- Transcribes via whisper-server HTTP API, copies result to clipboard
+- Server auto-starts on Hammerspoon load, shuts down after 5 min idle (configurable)
+- Exposes a status HTTP API on port 8989 (`/state`, `/toggle`)
 
 ## Features
 
-- **Audio ducking**: Lowers Music/Spotify volume to 10% while recording, restores on stop. Duck state is persisted to `/tmp/whisper_duck_state.txt` so volumes are restored even if Hammerspoon crashes/reloads.
+- **Whisper server management**: Model stays loaded in memory between transcriptions for sub-second latency. Auto-starts, auto-shuts down after idle timeout. Cleaned up on Hammerspoon reload/shutdown.
+- **Audio ducking**: Lowers Music/Spotify volume to 10% while recording with smooth 0.5s ramp down and 1.0s ramp up. Duck state is persisted to `/tmp/whisper_duck_state.txt` so volumes are restored even if Hammerspoon crashes/reloads.
 - **Border flash indicators**: Red persistent border while recording, yellow flash on stop (transcribing), green flash on transcription complete.
 - **Alerts**: Positioned at top of screen via `hs.alert.defaultStyle.atScreenEdge = 1`.
+
+## Important: ffmpeg termination
+
+ffmpeg MUST be terminated with SIGINT (not SIGKILL/terminate). SIGKILL produces an empty WAV file with no header, causing whisper to hallucinate "thank you." from silence. `hs.task:terminate()` sends SIGKILL — use `kill -INT <pid>` instead.
 
 ## State files
 
 - `/tmp/whisper_state.txt` — current state (idle/recording/transcribing/complete)
 - `/tmp/whisper_duck_state.txt` — saved app volumes during ducking (safety restore)
 - `/tmp/whisper_recording.wav` — temporary audio file (deleted after transcription)
+- `/tmp/whisper_debug.log` — debug log (cleared on each Hammerspoon reload)

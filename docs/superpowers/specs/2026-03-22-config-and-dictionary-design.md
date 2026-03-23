@@ -52,7 +52,7 @@ ROGER
 
 ## Whisper Integration
 
-On transcription (in `doTranscription`), read `dictionary.txt`, join all words with ", ", and pass as:
+On transcription (in `doTranscription`), read `dictionary.txt` from disk (always fresh, not cached), join all words with ", ", and pass as:
 
 ```
 -F "initial_prompt=Quantiiv, ROGER, ..."
@@ -65,21 +65,25 @@ in the curl call to `/inference`. If the dictionary is empty, omit the parameter
 On Hammerspoon load:
 
 1. Create `~/.local-voice-scribe/` if it doesn't exist
-2. If `config.lua` exists, `dofile()` it and merge with defaults
-3. If `dictionary.txt` exists, read it into a word list
-4. Use config values instead of hardcoded constants throughout `init.lua`
-5. Bind hotkeys from config
+2. If `config.lua` exists, load it with `pcall(dofile, path)`. On error, show `hs.alert` with the error message and fall back to all defaults
+3. Merge loaded config with defaults — any missing keys use default values
+4. If `dictionary.txt` exists, read it into a word list (cached in memory)
+5. Use config values instead of hardcoded constants: `duck_level`, `duck_ramp_down` (in `duckAudio`), `duck_ramp_up` (in `unduckAudio`), `server_idle_timeout`, hotkey bindings
+6. If `duck_enabled` is false, `duckAudio()` and `unduckAudio()` are no-ops
+7. Bind hotkeys from config
+
+`config.lua` is **not** auto-created — the directory is created but the file is left absent until the user creates it. This avoids confusion about whether defaults live in the file or in code (they live in code). `dictionary.txt` is created empty if missing.
 
 ## Volume Restoration Fix
 
-**Bug:** `unduckAudio` ramps back to the saved volume using floating-point step math, which can land at values like 70 instead of 100.
+**Bug:** `rampVolume` uses floating-point step math that can land at incorrect values (e.g., 70 instead of 100).
 
-**Fix:** User always runs audio at max volume. Instead of ramping back to the saved value, `unduckAudio` should ramp back to 100 (max). Additionally, after the ramp completes (final step), explicitly set the volume to the exact target value to guarantee it lands correctly.
+**Fix:** On the final step of `rampVolume`, explicitly call `setAppVolume(appName, toVol)` to snap to the exact target. This fixes drift for both ducking and unducking without hardcoding any value.
 
 ## Files Changed
 
 - `init.lua` — config loading, dictionary reading, webview editor, configurable hotkeys, initial_prompt in curl call, rampVolume fix
-- `~/.local-voice-scribe/config.lua` — created with defaults (if missing)
+- `~/.local-voice-scribe/config.lua` — not auto-created; user creates when they want to override defaults
 - `~/.local-voice-scribe/dictionary.txt` — created empty (if missing)
 - `CLAUDE.md` — updated to document config directory
 
@@ -87,4 +91,4 @@ On Hammerspoon load:
 
 - Post-processing find-and-replace (wrong→right mappings) — future enhancement if `initial_prompt` isn't sufficient
 - LLM-based spell correction pass
-- Config hot-reloading (requires Hammerspoon reload to pick up config changes; dictionary is reloaded on each save from editor)
+- Config hot-reloading (requires Hammerspoon reload to pick up config.lua changes; dictionary.txt is read fresh from disk on each transcription)

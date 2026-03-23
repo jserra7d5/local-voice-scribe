@@ -269,11 +269,42 @@ local function loadDictionary()
     local words = {}
     for line in file:lines() do
         local word = line:match("^%s*(.-)%s*$")
-        if word and #word > 0 then table.insert(words, word) end
+        if word and #word > 0 and not word:match("->") then
+            table.insert(words, word)
+        end
     end
     file:close()
     if #words == 0 then return nil end
     return table.concat(words, ", ")
+end
+
+local function loadReplacements()
+    local file = io.open(dictionaryFile, "r")
+    if not file then return {} end
+    local replacements = {}
+    for line in file:lines() do
+        local wrong, right = line:match("^%s*(.-)%s*->%s*(.-)%s*$")
+        if wrong and right and #wrong > 0 and #right > 0 then
+            table.insert(replacements, { wrong = wrong, right = right })
+        end
+    end
+    file:close()
+    return replacements
+end
+
+local function caseInsensitivePattern(pattern)
+    local result = pattern:gsub("%a", function(c)
+        return "[" .. c:upper() .. c:lower() .. "]"
+    end)
+    return result
+end
+
+local function applyReplacements(text)
+    local replacements = loadReplacements()
+    for _, r in ipairs(replacements) do
+        text = text:gsub(caseInsensitivePattern(r.wrong), r.right)
+    end
+    return text
 end
 
 local function startRecording()
@@ -361,6 +392,7 @@ local function doTranscription()
         log("parsed transcription=[" .. tostring(transcription) .. "]")
 
         if transcription and #transcription > 0 then
+            transcription = applyReplacements(transcription)
             hs.pasteboard.setContents(transcription)
             local preview = transcription
             if #preview > 60 then preview = preview:sub(1, 60) end
@@ -420,6 +452,10 @@ end
 -- Dictionary editor webview
 local dictWebview = nil
 
+local function closeDictEditor()
+    if dictWebview then dictWebview:delete(); dictWebview = nil end
+end
+
 local function readDictionaryRaw()
     local file = io.open(dictionaryFile, "r")
     if not file then return "" end
@@ -428,16 +464,38 @@ local function readDictionaryRaw()
     return content
 end
 
+hs.urlevent.bind("dict-save", function(eventName, params)
+    log("urlevent dict-save received")
+    local data = params.data or ""
+    local file = io.open(dictionaryFile, "w")
+    if file then
+        file:write(data)
+        file:close()
+        local count = 0
+        for line in data:gmatch("[^\n]+") do
+            if line:match("%S") then count = count + 1 end
+        end
+        hs.alert.show("Dictionary saved (" .. count .. " words)")
+    end
+    closeDictEditor()
+end)
+
+hs.urlevent.bind("dict-cancel", function()
+    log("urlevent dict-cancel received")
+    closeDictEditor()
+end)
+
 local function toggleDictionaryEditor()
+    log("toggleDictionaryEditor called")
+    local ok, err = pcall(function()
     if dictWebview then
-        dictWebview:delete()
-        dictWebview = nil
+        closeDictEditor()
         return
     end
 
     local screen = hs.screen.mainScreen():frame()
     local w, h = 400, 300
-    local rect = hs.geometry.rect(screen.x + screen.w - w - 20, screen.y + 40, w, h)
+    local rect = hs.geometry.rect(screen.x + (screen.w - w) / 2, screen.y + (screen.h - h) / 2, w, h)
 
     local content = readDictionaryRaw():gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"):gsub("'", "&#39;")
 
@@ -469,7 +527,7 @@ local function toggleDictionaryEditor()
 </style>
 </head>
 <body>
-<h3>Whisper Dictionary (one word per line)</h3>
+<h3>Whisper Dictionary (one word per line, or: wrong -> right)</h3>
 <textarea id="dict" autofocus>]] .. content .. [[</textarea>
 <div class="buttons">
     <button class="cancel" onclick="cancel()">Cancel</button>
@@ -494,46 +552,22 @@ local function toggleDictionaryEditor()
     dictWebview = hs.webview.new(rect)
     dictWebview:windowStyle({"titled", "closable", "resizable"})
     dictWebview:level(hs.canvas.windowLevels.floating)
-    dictWebview:title("Whisper Dictionary")
-    dictWebview:policyCallback(function(action, wv, url)
-        if action == "navigationAction" and url then
-            if url:match("^hammerspoon://dict%-save") then
-                local data = url:match("%?data=(.+)")
-                if data then
-                    data = data:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
-                    data = data:gsub("%+", " ")
-                    local file = io.open(dictionaryFile, "w")
-                    if file then
-                        file:write(data)
-                        file:close()
-                        local count = 0
-                        for line in data:gmatch("[^\n]+") do
-                            if line:match("%S") then count = count + 1 end
-                        end
-                        hs.alert.show("Dictionary saved (" .. count .. " words)")
-                    end
-                end
-                hs.timer.doAfter(0, function()
-                    if dictWebview then dictWebview:delete(); dictWebview = nil end
-                end)
-                return false
-            elseif url:match("^hammerspoon://dict%-cancel") then
-                hs.timer.doAfter(0, function()
-                    if dictWebview then dictWebview:delete(); dictWebview = nil end
-                end)
-                return false
-            end
-        end
-        return true
-    end)
+    dictWebview:windowTitle("Whisper Dictionary")
+    dictWebview:allowTextEntry(true)
     dictWebview:html(html)
+    dictWebview:bringToFront()
     dictWebview:show()
-    local win = dictWebview:hswindow()
-    if win then win:focus() end
+    end) -- end pcall
+    if not ok then
+        log("toggleDictionaryEditor ERROR: " .. tostring(err))
+        hs.alert.show("Dictionary editor error: " .. tostring(err), 5)
+    end
 end
 
 hs.hotkey.bind(config.hotkey_toggle_recording.mods, config.hotkey_toggle_recording.key, toggleRecording)
+log("bound recording hotkey: " .. config.hotkey_toggle_recording.key)
 hs.hotkey.bind(config.hotkey_dictionary_editor.mods, config.hotkey_dictionary_editor.key, toggleDictionaryEditor)
+log("bound dictionary hotkey: " .. config.hotkey_dictionary_editor.key)
 
 hs.shutdownCallback = function()
     stopWhisperServer()

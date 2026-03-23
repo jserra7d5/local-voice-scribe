@@ -25,6 +25,11 @@ Hammerspoon-based voice recording and transcription tool using whisper.cpp.
 - **Border flash indicators**: Red persistent border while recording, yellow flash on stop (transcribing), green flash on transcription complete.
 - **Alerts**: Positioned at top of screen via `hs.alert.defaultStyle.atScreenEdge = 1`.
 
+## User config: `~/.local-voice-scribe/`
+
+- **`config.lua`** (optional) — returns a Lua table to override defaults. Available keys: `duck_enabled`, `duck_level`, `duck_ramp_down`, `duck_ramp_up`, `server_idle_timeout`, `hotkey_toggle_recording`, `hotkey_dictionary_editor`. Missing keys use defaults. Loaded with `pcall` so errors don't crash init.
+- **`dictionary.txt`** — one word per line, fed to whisper as `initial_prompt` to bias spelling of proper nouns (e.g., Quantiiv). Edited via **Cmd+Alt+C** floating editor. Read fresh from disk on each transcription.
+
 ## Important: ffmpeg termination
 
 ffmpeg MUST be terminated with SIGINT (not SIGKILL/terminate). SIGKILL produces an empty WAV file with no header, causing whisper to hallucinate "thank you." from silence. `hs.task:terminate()` sends SIGKILL — use `kill -INT <pid>` instead.

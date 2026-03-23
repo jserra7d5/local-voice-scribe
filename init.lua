@@ -1,18 +1,51 @@
 -- Voice Recording & Whisper Transcription Script
 -- Hotkey: Cmd+Alt+R (toggle recording on/off)
 
+-- Config directory
+local configDir = os.getenv("HOME") .. "/.local-voice-scribe"
+local configFile = configDir .. "/config.lua"
+local dictionaryFile = configDir .. "/dictionary.txt"
+
+local defaults = {
+    duck_enabled = true,
+    duck_level = 10,
+    duck_ramp_down = 0.5,
+    duck_ramp_up = 1.0,
+    server_idle_timeout = 300,
+    hotkey_toggle_recording = { mods = {"cmd", "alt"}, key = "R" },
+    hotkey_dictionary_editor = { mods = {"cmd", "alt"}, key = "C" },
+}
+
+-- Load user config
+hs.fs.mkdir(configDir)
+local config = {}
+for k, v in pairs(defaults) do config[k] = v end
+
+if hs.fs.attributes(configFile) then
+    local ok, userConfig = pcall(dofile, configFile)
+    if ok and type(userConfig) == "table" then
+        for k, v in pairs(userConfig) do config[k] = v end
+    elseif not ok then
+        hs.alert.show("Config error: " .. tostring(userConfig), 10)
+    end
+end
+
+-- Create empty dictionary if missing
+if not hs.fs.attributes(dictionaryFile) then
+    local f = io.open(dictionaryFile, "w")
+    if f then f:close() end
+end
+
 local isRecording = false
 local recordingTask = nil
 local tempAudioFile = "/tmp/whisper_recording.wav"
 local whisperServerPath = "/Users/joeserra/Documents/whisper.cpp/build/bin/whisper-server"
 local modelPath = "/Users/joeserra/Documents/whisper.cpp/models/ggml-large-v3-turbo.bin"
 local whisperServerPort = 8178
-local whisperServerTimeout = 300
 local stateFile = "/tmp/whisper_state.txt"
 local duckStateFile = "/tmp/whisper_duck_state.txt"
 local logFile = "/tmp/whisper_debug.log"
 local currentState = "idle"
-local duckLevel = 10
 
 local function log(msg)
     local file = io.open(logFile, "a")
@@ -127,18 +160,22 @@ local function rampVolume(appName, fromVol, toVol, duration)
     duckRampTimers[appName] = hs.timer.doEvery(interval, function(timer)
         step = step + 1
         setAppVolume(appName, fromVol + (toVol - fromVol) * (step / steps))
-        if step >= steps then timer:stop(); duckRampTimers[appName] = nil end
+        if step >= steps then
+            setAppVolume(appName, toVol)
+            timer:stop(); duckRampTimers[appName] = nil
+        end
     end)
 end
 
 local function duckAudio()
+    if not config.duck_enabled then return end
     savedVolumes = {}
     for _, appName in ipairs({"Music", "Spotify"}) do
         if isAppRunning(appName) then
             local vol = getAppVolume(appName)
             if vol and vol > 0 then
                 savedVolumes[appName] = vol
-                rampVolume(appName, vol, vol * (duckLevel / 100), 0.5)
+                rampVolume(appName, vol, vol * (config.duck_level / 100), config.duck_ramp_down)
             end
         end
     end
@@ -146,9 +183,10 @@ local function duckAudio()
 end
 
 local function unduckAudio()
+    if not config.duck_enabled then return end
     for appName, vol in pairs(savedVolumes) do
         if isAppRunning(appName) then
-            rampVolume(appName, getAppVolume(appName) or (vol * (duckLevel / 100)), vol, 1.0)
+            rampVolume(appName, getAppVolume(appName) or (vol * (config.duck_level / 100)), vol, config.duck_ramp_up)
         end
     end
     clearDuckState()
@@ -176,7 +214,7 @@ end
 
 local function resetServerIdleTimer()
     if whisperIdleTimer then whisperIdleTimer:stop() end
-    whisperIdleTimer = hs.timer.doAfter(whisperServerTimeout, stopWhisperServer)
+    whisperIdleTimer = hs.timer.doAfter(config.server_idle_timeout, stopWhisperServer)
 end
 
 local function launchServerIfNeeded()
@@ -224,6 +262,19 @@ httpServer:setCallback(function(method, path, headers, body)
     end
 end)
 httpServer:start()
+
+local function loadDictionary()
+    local file = io.open(dictionaryFile, "r")
+    if not file then return nil end
+    local words = {}
+    for line in file:lines() do
+        local word = line:match("^%s*(.-)%s*$")
+        if word and #word > 0 then table.insert(words, word) end
+    end
+    file:close()
+    if #words == 0 then return nil end
+    return table.concat(words, ", ")
+end
 
 local function startRecording()
     isRecording = true
@@ -277,6 +328,20 @@ local function doTranscription()
     end
 
     log("sending file to server...")
+    local dictString = loadDictionary()
+    local curlArgs = {
+        "-s", "--max-time", "30",
+        "-X", "POST",
+        "-F", "file=@" .. tempAudioFile,
+        "-F", "response_format=json",
+    }
+    if dictString then
+        table.insert(curlArgs, "-F")
+        table.insert(curlArgs, "initial_prompt=" .. dictString)
+        log("using initial_prompt: " .. dictString)
+    end
+    table.insert(curlArgs, "http://127.0.0.1:" .. whisperServerPort .. "/inference")
+
     local curlTask = hs.task.new("/usr/bin/curl", function(exitCode, stdOut, stdErr)
         log("curl exit=" .. tostring(exitCode))
         log("curl stdout=[" .. tostring(stdOut) .. "]")
@@ -310,13 +375,7 @@ local function doTranscription()
 
         if hs.fs.attributes(tempAudioFile) then os.remove(tempAudioFile) end
         resetServerIdleTimer()
-    end, {
-        "-s", "--max-time", "30",
-        "-X", "POST",
-        "-F", "file=@" .. tempAudioFile,
-        "-F", "response_format=json",
-        "http://127.0.0.1:" .. whisperServerPort .. "/inference",
-    })
+    end, curlArgs)
     curlTask:start()
     log("curl started")
 end
@@ -351,7 +410,122 @@ function toggleRecording()
     end
 end
 
-hs.hotkey.bind({"cmd", "alt"}, "R", toggleRecording)
+-- Dictionary editor webview
+local dictWebview = nil
+
+local function readDictionaryRaw()
+    local file = io.open(dictionaryFile, "r")
+    if not file then return "" end
+    local content = file:read("*a")
+    file:close()
+    return content
+end
+
+local function toggleDictionaryEditor()
+    if dictWebview then
+        dictWebview:delete()
+        dictWebview = nil
+        return
+    end
+
+    local screen = hs.screen.mainScreen():frame()
+    local w, h = 400, 300
+    local rect = hs.geometry.rect(screen.x + screen.w - w - 20, screen.y + 40, w, h)
+
+    local content = readDictionaryRaw():gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"):gsub("'", "&#39;")
+
+    local html = [[
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+        background: #1e1e1e; color: #d4d4d4; font-family: -apple-system, sans-serif;
+        padding: 12px; display: flex; flex-direction: column; height: 100vh;
+    }
+    h3 { font-size: 13px; margin-bottom: 8px; color: #888; font-weight: 500; }
+    textarea {
+        flex: 1; background: #2d2d2d; color: #d4d4d4; border: 1px solid #444;
+        border-radius: 4px; padding: 8px; font-size: 14px; font-family: 'SF Mono', Menlo, monospace;
+        resize: none; outline: none;
+    }
+    textarea:focus { border-color: #666; }
+    .buttons { margin-top: 8px; display: flex; gap: 8px; justify-content: flex-end; }
+    button {
+        padding: 6px 16px; border: none; border-radius: 4px; font-size: 13px; cursor: pointer;
+    }
+    .save { background: #2ea043; color: white; }
+    .save:hover { background: #3fb950; }
+    .cancel { background: #444; color: #ccc; }
+    .cancel:hover { background: #555; }
+</style>
+</head>
+<body>
+<h3>Whisper Dictionary (one word per line)</h3>
+<textarea id="dict" autofocus>]] .. content .. [[</textarea>
+<div class="buttons">
+    <button class="cancel" onclick="cancel()">Cancel</button>
+    <button class="save" onclick="save()">Save</button>
+</div>
+<script>
+    function save() {
+        window.location.href = 'hammerspoon://dict-save?data=' + encodeURIComponent(document.getElementById('dict').value);
+    }
+    function cancel() {
+        window.location.href = 'hammerspoon://dict-cancel';
+    }
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') { cancel(); }
+        if (e.key === 's' && e.metaKey) { e.preventDefault(); save(); }
+    });
+</script>
+</body>
+</html>
+]]
+
+    dictWebview = hs.webview.new(rect)
+    dictWebview:windowStyle({"titled", "closable", "resizable"})
+    dictWebview:level(hs.drawing.windowLevels.floating)
+    dictWebview:title("Whisper Dictionary")
+    dictWebview:policyCallback(function(action, wv, url)
+        if action == "navigationAction" and url then
+            if url:match("^hammerspoon://dict%-save") then
+                local data = url:match("%?data=(.+)")
+                if data then
+                    data = data:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+                    data = data:gsub("%+", " ")
+                    local file = io.open(dictionaryFile, "w")
+                    if file then
+                        file:write(data)
+                        file:close()
+                        local count = 0
+                        for line in data:gmatch("[^\n]+") do
+                            if line:match("%S") then count = count + 1 end
+                        end
+                        hs.alert.show("Dictionary saved (" .. count .. " words)")
+                    end
+                end
+                hs.timer.doAfter(0, function()
+                    if dictWebview then dictWebview:delete(); dictWebview = nil end
+                end)
+                return false
+            elseif url:match("^hammerspoon://dict%-cancel") then
+                hs.timer.doAfter(0, function()
+                    if dictWebview then dictWebview:delete(); dictWebview = nil end
+                end)
+                return false
+            end
+        end
+        return true
+    end)
+    dictWebview:html(html)
+    dictWebview:show()
+    dictWebview:hswindow():focus()
+end
+
+hs.hotkey.bind(config.hotkey_toggle_recording.mods, config.hotkey_toggle_recording.key, toggleRecording)
+hs.hotkey.bind(config.hotkey_dictionary_editor.mods, config.hotkey_dictionary_editor.key, toggleDictionaryEditor)
 
 hs.shutdownCallback = function()
     stopWhisperServer()

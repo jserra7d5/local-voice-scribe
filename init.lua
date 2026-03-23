@@ -46,6 +46,7 @@ local duckStateFile = "/tmp/whisper_duck_state.txt"
 local logFile = "/tmp/whisper_debug.log"
 local currentState = "idle"
 local sessionId = 0
+local transcriptionStartedFor = nil
 local idleResetTimer = nil
 local ffmpegSafetyTimer = nil
 local serverPollTimer = nil
@@ -150,12 +151,20 @@ local function clearDuckState() os.remove(duckStateFile); savedVolumes = {} end
 local function restoreDuckState()
     local file = io.open(duckStateFile, "r")
     if not file then return end
+    local remaining = {}
     for line in file:lines() do
         local app, vol = line:match("(.+)=(%d+)")
-        if app and vol and isAppRunning(app) then setAppVolume(app, tonumber(vol)) end
+        if app and vol then
+            if isAppRunning(app) then
+                setAppVolume(app, tonumber(vol))
+            else
+                remaining[app] = tonumber(vol)
+            end
+        end
     end
     file:close()
-    clearDuckState()
+    savedVolumes = remaining
+    if next(savedVolumes) then saveDuckState() else clearDuckState() end
 end
 
 local duckRampTimers = {}
@@ -178,13 +187,14 @@ end
 
 local function duckAudio()
     if not config.duck_enabled then return end
-    savedVolumes = {}
     for _, appName in ipairs({"Music", "Spotify"}) do
         if isAppRunning(appName) then
-            local vol = getAppVolume(appName)
-            if vol and vol > 0 then
-                savedVolumes[appName] = vol
-                rampVolume(appName, vol, vol * (config.duck_level / 100), config.duck_ramp_down)
+            -- Preserve original volume if we already have it (e.g., unduck still ramping)
+            local original = savedVolumes[appName] or getAppVolume(appName)
+            if original and original > 0 then
+                savedVolumes[appName] = original
+                local current = getAppVolume(appName) or original
+                rampVolume(appName, current, original * (config.duck_level / 100), config.duck_ramp_down)
             end
         end
     end
@@ -345,11 +355,23 @@ local function finishTranscription(message)
     clearBorder()
     updateState("idle")
     resetServerIdleTimer()
+    transcriptionStartedFor = nil
     if message then hs.alert.show(message, 3) end
+end
+
+local function startTranscriptionOnce(gen)
+    if gen ~= sessionId or transcriptionStartedFor == gen then return end
+    transcriptionStartedFor = gen
+    local ok, err = pcall(doTranscription, gen)
+    if not ok then
+        log("doTranscription ERROR: " .. tostring(err))
+        finishTranscription("Transcription error: " .. tostring(err))
+    end
 end
 
 local function startRecording()
     sessionId = sessionId + 1
+    transcriptionStartedFor = nil
     local gen = sessionId
     updateState("recording")
     log("startRecording session=" .. gen)
@@ -385,11 +407,7 @@ local function startRecording()
         -- Normal exit after SIGINT — trigger transcription
         if currentState == "transcribing" then
             if ffmpegSafetyTimer then ffmpegSafetyTimer:stop(); ffmpegSafetyTimer = nil end
-            local tok, terr = pcall(doTranscription, gen)
-            if not tok then
-                log("doTranscription ERROR: " .. tostring(terr))
-                finishTranscription("Transcription error: " .. tostring(terr))
-            end
+            startTranscriptionOnce(gen)
         end
     end, {
         "-y", "-f", "avfoundation", "-i", ":default",
@@ -469,9 +487,9 @@ function doTranscription(gen)
             return
         end
 
-        local transcription = stdOut:match('"text"%s*:%s*"(.-)"')
-        if transcription then
-            transcription = transcription:gsub("\\n", " "):gsub("\\(.)", "%1")
+        local payload = hs.json.decode(stdOut)
+        local transcription = payload and payload.text
+        if type(transcription) == "string" then
             transcription = transcription:match("^%s*(.-)%s*$")
         end
         log("parsed transcription=[" .. tostring(transcription) .. "]")
@@ -528,11 +546,7 @@ local function stopRecording()
             recordingTask = nil
         end
         -- Trigger transcription directly since callback may not fire
-        local ok, err = pcall(doTranscription, gen)
-        if not ok then
-            log("doTranscription ERROR after safety timeout: " .. tostring(err))
-            finishTranscription("Transcription error: " .. tostring(err))
-        end
+        startTranscriptionOnce(gen)
     end)
 end
 

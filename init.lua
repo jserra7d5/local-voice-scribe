@@ -5,6 +5,8 @@
 local configDir = os.getenv("HOME") .. "/.local-voice-scribe"
 local configFile = configDir .. "/config.lua"
 local dictionaryFile = configDir .. "/dictionary.txt"
+local runtimeFile = configDir .. "/runtime.lua"
+local logFile = "/tmp/whisper_debug.log"
 
 local defaults = {
     duck_enabled = true,
@@ -14,18 +16,54 @@ local defaults = {
     server_idle_timeout = 300,
     hotkey_toggle_recording = { mods = {"cmd", "alt"}, key = "R" },
     hotkey_dictionary_editor = { mods = {"cmd", "alt"}, key = "C" },
+    ffmpeg_path = nil,
+    whisper_server_path = nil,
+    whisper_public_path = nil,
+    model_path = nil,
+    ggml_metal_path_resources = nil,
+    install_token = nil,
+    repo_root = nil,
 }
 
--- Load user config
 hs.fs.mkdir(configDir)
 local config = {}
 for k, v in pairs(defaults) do config[k] = v end
 
+local runtimeOwnedKeys = {
+    ffmpeg_path = true,
+    whisper_server_path = true,
+    whisper_public_path = true,
+    model_path = true,
+    ggml_metal_path_resources = true,
+    install_token = true,
+    repo_root = true,
+}
+
+local function mergeConfig(candidate, source)
+    if type(candidate) ~= "table" then return end
+    for k, v in pairs(candidate) do
+        if source == "user" and runtimeOwnedKeys[k] then
+            hs.alert.show("Ignoring installer-owned config key: " .. k, 5)
+        else
+            config[k] = v
+        end
+    end
+end
+
+if hs.fs.attributes(runtimeFile) then
+    local ok, runtimeConfig = pcall(dofile, runtimeFile)
+    if ok then
+        mergeConfig(runtimeConfig, "runtime")
+    else
+        hs.alert.show("Runtime config error: " .. tostring(runtimeConfig), 10)
+    end
+end
+
 if hs.fs.attributes(configFile) then
     local ok, userConfig = pcall(dofile, configFile)
-    if ok and type(userConfig) == "table" then
-        for k, v in pairs(userConfig) do config[k] = v end
-    elseif not ok then
+    if ok then
+        mergeConfig(userConfig, "user")
+    else
         hs.alert.show("Config error: " .. tostring(userConfig), 10)
     end
 end
@@ -36,15 +74,64 @@ if not hs.fs.attributes(dictionaryFile) then
     if f then f:close() end
 end
 
+local function trim(s)
+    if type(s) ~= "string" then return nil end
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function shellQuote(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+local function resolveCommand(name)
+    local cmd = "/bin/sh -c " .. shellQuote("PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin command -v " .. name .. " 2>/dev/null")
+    local output = hs.execute(cmd, true)
+    output = trim(output)
+    if output and #output > 0 then return output end
+    return nil
+end
+
+local function pathExists(path)
+    return type(path) == "string" and hs.fs.attributes(path) ~= nil
+end
+
+local function firstExistingPath(candidates)
+    for _, candidate in ipairs(candidates) do
+        if pathExists(candidate) then return candidate end
+    end
+    return nil
+end
+
 local recordingTask = nil
 local tempAudioFile = "/tmp/whisper_recording.wav"
-local whisperServerPath = "/Users/joeserra/Documents/whisper.cpp/build/bin/whisper-server"
-local modelPath = "/Users/joeserra/Documents/whisper.cpp/models/ggml-large-v3-turbo.bin"
+local ffmpegPath = config.ffmpeg_path
+    or firstExistingPath({
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+    })
+    or resolveCommand("ffmpeg")
+local legacyWhisperRoot = os.getenv("HOME") .. "/Documents/whisper.cpp"
+local whisperServerPath = config.whisper_server_path
+    or firstExistingPath({
+        legacyWhisperRoot .. "/build/bin/whisper-server",
+    })
+    or resolveCommand("whisper-server")
+local whisperPublicPath = config.whisper_public_path
+    or firstExistingPath({
+        configDir .. "/whisper/public",
+        legacyWhisperRoot .. "/examples/server/public",
+    })
+local modelPath = config.model_path
+    or firstExistingPath({
+        configDir .. "/models/ggml-large-v3-turbo.bin",
+        legacyWhisperRoot .. "/models/ggml-large-v3-turbo.bin",
+    })
+local ggmlMetalPathResources = config.ggml_metal_path_resources
 local whisperServerPort = 8178
 local stateFile = "/tmp/whisper_state.txt"
 local duckStateFile = "/tmp/whisper_duck_state.txt"
-local logFile = "/tmp/whisper_debug.log"
 local currentState = "idle"
+local installToken = config.install_token or "legacy"
 local sessionId = 0
 local transcriptionStartedFor = nil
 local idleResetTimer = nil
@@ -62,6 +149,34 @@ end
 do
     local file = io.open(logFile, "w")
     if file then file:write("=== Hammerspoon reload " .. os.date() .. " ===\n"); file:close() end
+end
+
+local function ensureWhisperDependencies()
+    if not pathExists(whisperServerPath) then
+        log("whisper-server missing: " .. tostring(whisperServerPath))
+        hs.alert.show("whisper-server not found. Run setup.sh.", 5)
+        return false
+    end
+    if whisperPublicPath and not pathExists(whisperPublicPath) then
+        log("whisper public assets missing: " .. tostring(whisperPublicPath))
+        hs.alert.show("Whisper public assets missing. Run setup.sh.", 5)
+        return false
+    end
+    if not pathExists(modelPath) then
+        log("model missing: " .. tostring(modelPath))
+        hs.alert.show("Whisper model missing. Run setup.sh.", 5)
+        return false
+    end
+    return true
+end
+
+local function ensureFfmpegDependency()
+    if not pathExists(ffmpegPath) then
+        log("ffmpeg missing: " .. tostring(ffmpegPath))
+        hs.alert.show("ffmpeg not found. Run setup.sh.", 5)
+        return false
+    end
+    return true
 end
 
 hs.alert.defaultStyle.atScreenEdge = 1
@@ -109,10 +224,10 @@ local function flashBorder(colorName)
     local gen = createBorder(color, 0.9)
     local steps = 11
     local step = 0
-    borderFadeTimer = hs.timer.doEvery(0.05, function(timer)
+    borderFadeTimer = hs.timer.doEvery(0.05, function()
         step = step + 1
         if step >= steps or gen ~= borderGeneration or not borderCanvas then
-            timer:stop()
+            if borderFadeTimer then borderFadeTimer:stop(); borderFadeTimer = nil end
             if gen == borderGeneration then clearBorder() end
             return
         end
@@ -174,12 +289,12 @@ local function rampVolume(appName, fromVol, toVol, duration, onComplete)
     local steps = 10
     local interval = duration / steps
     local step = 0
-    duckRampTimers[appName] = hs.timer.doEvery(interval, function(timer)
+    duckRampTimers[appName] = hs.timer.doEvery(interval, function()
         step = step + 1
         setAppVolume(appName, fromVol + (toVol - fromVol) * (step / steps))
         if step >= steps then
             setAppVolume(appName, toVol)
-            timer:stop(); duckRampTimers[appName] = nil
+            if duckRampTimers[appName] then duckRampTimers[appName]:stop(); duckRampTimers[appName] = nil end
             if onComplete then onComplete() end
         end
     end)
@@ -249,6 +364,7 @@ local function suspendServerIdleTimer()
 end
 
 local function launchServerIfNeeded()
+    if not ensureWhisperDependencies() then return end
     if isServerUp() then
         log("server already up")
         resetServerIdleTimer()
@@ -258,11 +374,21 @@ local function launchServerIfNeeded()
     log("launching new server")
     hs.execute("lsof -ti:" .. whisperServerPort .. " | xargs kill -9 2>/dev/null", true)
 
+    local envPrefix = ""
+    if pathExists(ggmlMetalPathResources) then
+        envPrefix = "GGML_METAL_PATH_RESOURCES=" .. shellQuote(ggmlMetalPathResources) .. " "
+    end
     whisperServerTask = hs.task.new("/bin/sh", function(exitCode)
         log("whisper-server exited: " .. tostring(exitCode))
         whisperServerTask = nil
     end, {
-        "-c", whisperServerPath .. " -m " .. modelPath .. " -l en --port " .. tostring(whisperServerPort) .. " --host 127.0.0.1 >/dev/null 2>&1"
+        "-c", envPrefix
+            .. shellQuote(whisperServerPath)
+            .. " -m " .. shellQuote(modelPath)
+            .. " -l en --port " .. tostring(whisperServerPort)
+            .. " --host 127.0.0.1"
+            .. (whisperPublicPath and (" --public " .. shellQuote(whisperPublicPath)) or "")
+            .. " >/dev/null 2>&1"
     })
     whisperServerTask:start()
     log("server task started")
@@ -278,11 +404,20 @@ local function updateState(state)
     if file then file:write(state); file:close() end
 end
 
-local httpServer = hs.httpserver.new(false, false)
+httpServer = hs.httpserver.new(false, false)
 httpServer:setPort(8989)
 httpServer:setCallback(function(method, path, headers, body)
     if path == "/state" then
-        return '{"state":"' .. currentState .. '"}', 200, {["Content-Type"] = "application/json"}
+        local payload = hs.json.encode({
+            state = currentState,
+            install_token = installToken,
+            repo_root = config.repo_root,
+            ffmpeg_path = ffmpegPath,
+            whisper_server_path = whisperServerPath,
+            whisper_public_path = whisperPublicPath,
+            model_path = modelPath,
+        })
+        return payload, 200, {["Content-Type"] = "application/json"}
     elseif path == "/toggle" then
         toggleRecording()
         return '{"status":"ok"}', 200, {["Content-Type"] = "application/json"}
@@ -370,6 +505,9 @@ local function startTranscriptionOnce(gen)
 end
 
 local function startRecording()
+    if not ensureFfmpegDependency() then return end
+    if not ensureWhisperDependencies() then return end
+
     sessionId = sessionId + 1
     transcriptionStartedFor = nil
     local gen = sessionId
@@ -392,7 +530,7 @@ local function startRecording()
     showBorder("recording")
     hs.alert.show("Recording started")
 
-    recordingTask = hs.task.new("/opt/homebrew/bin/ffmpeg", function(exitCode)
+    recordingTask = hs.task.new(ffmpegPath, function(exitCode)
         log("ffmpeg exited: " .. tostring(exitCode) .. " session=" .. gen)
         if gen ~= sessionId then log("ffmpeg callback: stale session, ignoring"); return end
 
@@ -694,4 +832,8 @@ hs.shutdownCallback = function()
 end
 
 updateState("idle")
-hs.alert.show("Whisper recording ready (Cmd+Alt+R)")
+if pathExists(ffmpegPath) and pathExists(whisperServerPath) and pathExists(modelPath) then
+    hs.alert.show("Whisper recording ready (Cmd+Alt+R)")
+else
+    hs.alert.show("Whisper loaded; run setup.sh to finish install")
+end

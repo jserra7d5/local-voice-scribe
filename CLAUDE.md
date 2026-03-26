@@ -4,11 +4,17 @@ Hammerspoon-based voice recording and transcription tool using whisper.cpp.
 
 ## Setup
 
+- Bootstrap with `./scripts/setup.sh --yes`
+- Verify with `./scripts/setup.sh --doctor`
 - `init.lua` is the main (and only) script
-- Symlinked to `~/.hammerspoon/init.lua`
-- Uses whisper-server at `/Users/joeserra/Documents/whisper.cpp/build/bin/whisper-server` (port 8178)
-- Model: `ggml-large-v3-turbo` at `/Users/joeserra/Documents/whisper.cpp/models/`
-- Requires ffmpeg (`/opt/homebrew/bin/ffmpeg`) for audio capture
+- Hammerspoon loads this repo through a managed block in `~/.hammerspoon/init.lua`
+- Setup refuses to rewrite unmanaged `~/.hammerspoon/init.lua` files
+- Installer-managed runtime paths live in `~/.local-voice-scribe/runtime.lua`
+- User overrides live in `~/.local-voice-scribe/config.lua`
+- Model: `ggml-large-v3-turbo` at `~/.local-voice-scribe/models/ggml-large-v3-turbo.bin`
+- Source-built `whisper-server`: `~/.local-voice-scribe/whisper/bin/whisper-server`
+- Whisper public assets: `~/.local-voice-scribe/whisper/public`
+- Requires `ffmpeg`, `cmake`, and `Hammerspoon`, installed by `scripts/setup.sh`
 
 ## How it works
 
@@ -27,7 +33,8 @@ Hammerspoon-based voice recording and transcription tool using whisper.cpp.
 
 ## User config: `~/.local-voice-scribe/`
 
-- **`config.lua`** (optional) — returns a Lua table to override defaults. Available keys: `duck_enabled`, `duck_level`, `duck_ramp_down`, `duck_ramp_up`, `server_idle_timeout`, `hotkey_toggle_recording`, `hotkey_dictionary_editor`. Missing keys use defaults. Loaded with `pcall` so errors don't crash init.
+- **`config.lua`** (optional) — returns a Lua table to override behavior settings such as `duck_enabled`, `duck_level`, `duck_ramp_down`, `duck_ramp_up`, `server_idle_timeout`, `hotkey_toggle_recording`, and `hotkey_dictionary_editor`. Installer-owned path keys in this file are ignored.
+- **`runtime.lua`** (installer-managed) — returns a Lua table with resolved paths for `ffmpeg_path`, `whisper_server_path`, `whisper_public_path`, `model_path`, `install_token`, `repo_root`, and `ggml_metal_path_resources`.
 - **`dictionary.txt`** — one word per line, fed to whisper as `initial_prompt` to bias spelling of proper nouns (e.g., Quantiiv). Edited via **Cmd+Alt+C** floating editor. Read fresh from disk on each transcription.
 
 ## Important: ffmpeg termination

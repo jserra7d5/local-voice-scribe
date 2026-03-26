@@ -1,1 +1,12 @@
 .DS_Store
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+
+.idea/
+.vscode/
+
+build/
+cmake-build-*/

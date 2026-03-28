@@ -7,6 +7,7 @@ local configFile = configDir .. "/config.lua"
 local dictionaryFile = configDir .. "/dictionary.txt"
 local runtimeFile = configDir .. "/runtime.lua"
 local logFile = "/tmp/whisper_debug.log"
+local transcriptDir = "/tmp/local-voice-scribe-transcripts"
 
 local defaults = {
     duck_enabled = true,
@@ -16,6 +17,7 @@ local defaults = {
     server_idle_timeout = 300,
     hotkey_toggle_recording = { mods = {"cmd", "alt"}, key = "R" },
     hotkey_dictionary_editor = { mods = {"cmd", "alt"}, key = "C" },
+    hotkey_open_transcripts = { mods = {"cmd", "alt"}, key = "T" },
     ffmpeg_path = nil,
     whisper_server_path = nil,
     whisper_public_path = nil,
@@ -38,6 +40,8 @@ local runtimeOwnedKeys = {
     install_token = true,
     repo_root = true,
 }
+
+local log
 
 local function mergeConfig(candidate, source)
     if type(candidate) ~= "table" then return end
@@ -102,6 +106,55 @@ local function firstExistingPath(candidates)
     return nil
 end
 
+local function ensureDirectory(path)
+    if pathExists(path) then return true end
+    local ok, err = pcall(hs.fs.mkdir, path)
+    if ok and pathExists(path) then return true end
+    return false, err
+end
+
+local function transcriptFilename(startedAt, durationSeconds)
+    local stamp = os.date("%Y-%m-%d_%H-%M-%S", math.floor(startedAt or hs.timer.secondsSinceEpoch()))
+    local duration = math.max(1, math.floor(tonumber(durationSeconds) or 0))
+    return string.format("transcript_%s__dur-%ss.txt", stamp, duration)
+end
+
+local function archiveTranscription(text, startedAt, durationSeconds)
+    if type(text) ~= "string" or text == "" then
+        return nil, "empty transcription"
+    end
+
+    local ok, err = ensureDirectory(transcriptDir)
+    if not ok then
+        return nil, "could not create transcript directory: " .. tostring(err)
+    end
+
+    local path = transcriptDir .. "/" .. transcriptFilename(startedAt, durationSeconds)
+    local file, openErr = io.open(path, "w")
+    if not file then
+        return nil, "could not open transcript file: " .. tostring(openErr)
+    end
+    file:write(text)
+    file:close()
+    log("saved transcript file: " .. path)
+    return path
+end
+
+local function openTranscriptFolder()
+    local ok, err = ensureDirectory(transcriptDir)
+    if not ok then
+        log("failed to create transcript directory: " .. tostring(err))
+        hs.alert.show("Could not create transcript folder", 3)
+        return
+    end
+
+    local output, success = hs.execute("/usr/bin/open " .. shellQuote(transcriptDir), true)
+    if not success then
+        log("failed to open transcript folder: " .. tostring(output))
+        hs.alert.show("Could not open transcript folder", 3)
+    end
+end
+
 local recordingTask = nil
 local tempAudioFile = "/tmp/whisper_recording.wav"
 local ffmpegPath = config.ffmpeg_path
@@ -134,11 +187,13 @@ local currentState = "idle"
 local installToken = config.install_token or "legacy"
 local sessionId = 0
 local transcriptionStartedFor = nil
+local recordingStartedAt = nil
+local lastRecordingDurationSeconds = nil
 local idleResetTimer = nil
 local ffmpegSafetyTimer = nil
 local serverPollTimer = nil
 
-local function log(msg)
+log = function(msg)
     local file = io.open(logFile, "a")
     if file then
         file:write(os.date("%H:%M:%S") .. " " .. msg .. "\n")
@@ -491,6 +546,8 @@ local function finishTranscription(message)
     updateState("idle")
     resetServerIdleTimer()
     transcriptionStartedFor = nil
+    recordingStartedAt = nil
+    lastRecordingDurationSeconds = nil
     if message then hs.alert.show(message, 3) end
 end
 
@@ -510,9 +567,11 @@ local function startRecording()
 
     sessionId = sessionId + 1
     transcriptionStartedFor = nil
+    lastRecordingDurationSeconds = nil
     local gen = sessionId
     updateState("recording")
     log("startRecording session=" .. gen)
+    recordingStartedAt = hs.timer.secondsSinceEpoch()
 
     -- Cancel any pending idle reset from previous complete state
     if idleResetTimer then idleResetTimer:stop(); idleResetTimer = nil end
@@ -634,12 +693,20 @@ function doTranscription(gen)
 
         if transcription and #transcription > 0 then
             transcription = applyReplacements(transcription)
+            local transcriptPath, archiveErr = archiveTranscription(transcription, recordingStartedAt, lastRecordingDurationSeconds)
+            if transcriptPath then
+                log("archived transcript to " .. transcriptPath)
+            else
+                log("archiveTranscription failed: " .. tostring(archiveErr))
+            end
             hs.pasteboard.setContents(transcription)
             local preview = transcription
             if #preview > 60 then preview = preview:sub(1, 60) end
             updateState("complete")
             flashBorder("complete")
             hs.alert.show("Copied to clipboard\n\n" .. preview, 5)
+            recordingStartedAt = nil
+            lastRecordingDurationSeconds = nil
             idleResetTimer = hs.timer.doAfter(3, function()
                 if gen ~= sessionId then return end
                 updateState("idle")
@@ -659,6 +726,12 @@ end
 local function stopRecording()
     log("stopRecording")
     local gen = sessionId
+    if recordingStartedAt then
+        local elapsed = hs.timer.secondsSinceEpoch() - recordingStartedAt
+        lastRecordingDurationSeconds = math.max(1, math.floor(elapsed + 0.5))
+    else
+        lastRecordingDurationSeconds = nil
+    end
 
     -- Update state BEFORE sending SIGINT so ffmpeg callback knows this is intentional
     unduckAudio()
@@ -825,6 +898,8 @@ hs.hotkey.bind(config.hotkey_toggle_recording.mods, config.hotkey_toggle_recordi
 log("bound recording hotkey: " .. config.hotkey_toggle_recording.key)
 hs.hotkey.bind(config.hotkey_dictionary_editor.mods, config.hotkey_dictionary_editor.key, toggleDictionaryEditor)
 log("bound dictionary hotkey: " .. config.hotkey_dictionary_editor.key)
+hs.hotkey.bind(config.hotkey_open_transcripts.mods, config.hotkey_open_transcripts.key, openTranscriptFolder)
+log("bound transcript hotkey: " .. config.hotkey_open_transcripts.key)
 
 hs.shutdownCallback = function()
     stopWhisperServer()

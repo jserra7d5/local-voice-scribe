@@ -74,8 +74,9 @@ For a non-mutating verification pass:
 
 - `Cmd+Alt+R` toggles recording
 - `Cmd+Alt+C` opens the floating dictionary editor
+- `Cmd+Alt+T` opens the transcript temp folder in Finder
 - Hammerspoon starts `whisper-server` on load and shuts it down after an idle timeout
-- Transcriptions are copied to the clipboard
+- Successful transcriptions are copied to the clipboard and archived under `/tmp/local-voice-scribe-transcripts`
 - Status API runs on `http://127.0.0.1:8989/state`
 
 ## Troubleshooting

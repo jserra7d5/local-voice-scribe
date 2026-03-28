@@ -19,8 +19,9 @@ Hammerspoon-based voice recording and transcription tool using whisper.cpp.
 ## How it works
 
 - **Cmd+Alt+R** toggles recording on/off
+- **Cmd+Alt+T** opens the transcript temp folder
 - Records from the system default audio input device via ffmpeg/avfoundation
-- Transcribes via whisper-server HTTP API, copies result to clipboard
+- Transcribes via whisper-server HTTP API, copies result to clipboard, and archives successful transcripts to a temp folder
 - Server auto-starts on Hammerspoon load, shuts down after 5 min idle (configurable)
 - Exposes a status HTTP API on port 8989 (`/state`, `/toggle`)
 
@@ -33,7 +34,7 @@ Hammerspoon-based voice recording and transcription tool using whisper.cpp.
 
 ## User config: `~/.local-voice-scribe/`
 
-- **`config.lua`** (optional) — returns a Lua table to override behavior settings such as `duck_enabled`, `duck_level`, `duck_ramp_down`, `duck_ramp_up`, `server_idle_timeout`, `hotkey_toggle_recording`, and `hotkey_dictionary_editor`. Installer-owned path keys in this file are ignored.
+- **`config.lua`** (optional) — returns a Lua table to override behavior settings such as `duck_enabled`, `duck_level`, `duck_ramp_down`, `duck_ramp_up`, `server_idle_timeout`, `hotkey_toggle_recording`, `hotkey_dictionary_editor`, and `hotkey_open_transcripts`. Installer-owned path keys in this file are ignored.
 - **`runtime.lua`** (installer-managed) — returns a Lua table with resolved paths for `ffmpeg_path`, `whisper_server_path`, `whisper_public_path`, `model_path`, `install_token`, `repo_root`, and `ggml_metal_path_resources`.
 - **`dictionary.txt`** — one word per line, fed to whisper as `initial_prompt` to bias spelling of proper nouns (e.g., Quantiiv). Edited via **Cmd+Alt+C** floating editor. Read fresh from disk on each transcription.
 
@@ -46,4 +47,5 @@ ffmpeg MUST be terminated with SIGINT (not SIGKILL/terminate). SIGKILL produces 
 - `/tmp/whisper_state.txt` — current state (idle/recording/transcribing/complete)
 - `/tmp/whisper_duck_state.txt` — saved app volumes during ducking (safety restore)
 - `/tmp/whisper_recording.wav` — temporary audio file (deleted after transcription)
+- `/tmp/local-voice-scribe-transcripts/` — archived successful transcripts as `transcript_YYYY-MM-DD_HH-MM-SS__dur-NNs.txt`
 - `/tmp/whisper_debug.log` — debug log (cleared on each Hammerspoon reload)

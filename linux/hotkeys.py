@@ -1,19 +1,21 @@
-"""Global hotkey manager — KDE via qdbus CLI + dbus-monitor, pynput fallback."""
+"""Global hotkey manager — X11 via python-xlib XGrabKey, pynput fallback."""
 
 import os
-import shutil
-import subprocess
 import threading
 from typing import Callable
 
-# Check if KDE kglobalaccel is available via qdbus
-_HAS_QDBUS = shutil.which("qdbus") is not None
-_HAS_DBUS_MONITOR = shutil.which("dbus-monitor") is not None
-_USE_KDE = _HAS_QDBUS and _HAS_DBUS_MONITOR
+# Try X11 native key grabbing first (most reliable on X11)
+_USE_XLIB = False
+try:
+    from Xlib import X, XK, display as xdisplay, error as xerror
+    if os.environ.get("DISPLAY"):
+        _USE_XLIB = True
+except ImportError:
+    pass
 
-# Fallback
+# Fallback to pynput
 _USE_PYNPUT = False
-if not _USE_KDE:
+if not _USE_XLIB:
     try:
         from pynput import keyboard
         from pynput.keyboard import Key, KeyCode
@@ -22,155 +24,150 @@ if not _USE_KDE:
         pass
 
 
-# ─── Qt key code mapping ───
+# ─── X11 modifier and key mapping ───
 
-_QT_KEY_MAP = {
-    "a": 0x41, "b": 0x42, "c": 0x43, "d": 0x44, "e": 0x45,
-    "f": 0x46, "g": 0x47, "h": 0x48, "i": 0x49, "j": 0x4a,
-    "k": 0x4b, "l": 0x4c, "m": 0x4d, "n": 0x4e, "o": 0x4f,
-    "p": 0x50, "q": 0x51, "r": 0x52, "s": 0x53, "t": 0x54,
-    "u": 0x55, "v": 0x56, "w": 0x57, "x": 0x58, "y": 0x59, "z": 0x5a,
-    "0": 0x30, "1": 0x31, "2": 0x32, "3": 0x33, "4": 0x34,
-    "5": 0x35, "6": 0x36, "7": 0x37, "8": 0x38, "9": 0x39,
-    "space": 0x20, "return": 0x01000004, "enter": 0x01000004,
-    "escape": 0x01000000, "tab": 0x01000001,
-}
-_QT_MOD_MAP = {
-    "shift": 0x02000000,
-    "ctrl": 0x04000000,
-    "alt": 0x08000000,
-    "super": 0x10000000,
+_X11_MOD_MAP = {
+    "shift": "Shift_L",
+    "ctrl": "Control_L",
+    "alt": "Alt_L",
+    "super": "Super_L",
 }
 
+# X11 modifier mask bits
+_X11_MOD_MASKS = {
+    "shift": X.ShiftMask if _USE_XLIB else 0,
+    "ctrl": X.ControlMask if _USE_XLIB else 0,
+    "alt": X.Mod1Mask if _USE_XLIB else 0,      # Alt is typically Mod1
+    "super": X.Mod4Mask if _USE_XLIB else 0,     # Super is typically Mod4
+}
 
-def _combo_to_qt_keycode(combo_str: str) -> int:
+# Extra modifier masks that may be active (NumLock, CapsLock, ScrollLock)
+# We need to grab with all combinations of these to catch keypresses
+# regardless of lock key state
+_LOCK_MASKS = [0]
+if _USE_XLIB:
+    _LOCK_MASKS = [
+        0,
+        X.LockMask,                    # CapsLock
+        X.Mod2Mask,                    # NumLock (usually Mod2)
+        X.LockMask | X.Mod2Mask,      # Both
+    ]
+
+
+def _parse_combo(combo_str: str) -> tuple[int, str]:
+    """Parse 'super+alt+r' into (modifier_mask, key_name)."""
     parts = combo_str.lower().replace("<", "").replace(">", "").split("+")
     modifiers = 0
-    key = 0
+    key_name = ""
     for part in parts:
         part = part.strip()
         if not part:
             continue
         if part in ("ctrl", "control"):
-            modifiers |= _QT_MOD_MAP["ctrl"]
+            modifiers |= _X11_MOD_MASKS.get("ctrl", 0)
         elif part == "shift":
-            modifiers |= _QT_MOD_MAP["shift"]
+            modifiers |= _X11_MOD_MASKS.get("shift", 0)
         elif part in ("alt", "option"):
-            modifiers |= _QT_MOD_MAP["alt"]
+            modifiers |= _X11_MOD_MASKS.get("alt", 0)
         elif part in ("super", "win", "cmd", "meta", "windows"):
-            modifiers |= _QT_MOD_MAP["super"]
-        elif part in _QT_KEY_MAP:
-            key = _QT_KEY_MAP[part]
-        elif len(part) == 1:
-            key = ord(part.upper())
-    return modifiers | key
+            modifiers |= _X11_MOD_MASKS.get("super", 0)
+        else:
+            key_name = part
+    return modifiers, key_name
 
 
-# ─── KDE implementation via qdbus CLI + dbus-monitor ───
+# ─── X11 XGrabKey implementation ───
 
-class _KDEHotkeyManager:
-    """Register shortcuts via qdbus, listen via dbus-monitor. No Python D-Bus binding needed."""
-
-    COMPONENT = "local-voice-scribe"
-    COMPONENT_PATH = "/component/local_voice_scribe"
+class _X11HotkeyManager:
+    """Grab global hotkeys via X11 XGrabKey — most reliable on X11 sessions."""
 
     def __init__(self):
-        self._callbacks: dict[str, Callable] = {}
-        self._monitor_proc: subprocess.Popen | None = None
-        self._monitor_thread: threading.Thread | None = None
+        self._callbacks: dict[tuple[int, int], Callable] = {}  # (mod_mask, keycode) -> callback
+        self._display = None
+        self._root = None
+        self._thread: threading.Thread | None = None
+        self._running = False
 
     def register(self, combo: str, action_name: str, callback: Callable):
-        qt_key = _combo_to_qt_keycode(combo)
-        self._callbacks[action_name] = callback
-
-        # Register via qdbus using invokeShortcut-compatible names
-        # First, register the action
-        subprocess.run([
-            "qdbus", "org.kde.kglobalaccel", "/kglobalaccel",
-            "org.kde.KGlobalAccel.doRegister",
-            self.COMPONENT, action_name, "Local Voice Scribe", action_name,
-        ], capture_output=True, timeout=5)
-
-        # Set the shortcut key
-        subprocess.run([
-            "qdbus", "org.kde.kglobalaccel", "/kglobalaccel",
-            "org.kde.KGlobalAccel.setForeignShortcut",
-            self.COMPONENT, action_name, "Local Voice Scribe", action_name,
-            str(qt_key),
-        ], capture_output=True, timeout=5)
+        mod_mask, key_name = _parse_combo(combo)
+        # We'll resolve keycodes in start() when display is open
+        self._callbacks[(mod_mask, key_name)] = callback
 
     def start(self):
-        """Start dbus-monitor to listen for globalShortcutPressed signals."""
-        self._monitor_proc = subprocess.Popen(
-            [
-                "dbus-monitor", "--session",
-                f"type='signal',interface='org.kde.kglobalaccel.Component',"
-                f"member='globalShortcutPressed',"
-                f"path='{self.COMPONENT_PATH}'",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        self._monitor_thread = threading.Thread(target=self._read_signals, daemon=True)
-        self._monitor_thread.start()
+        self._display = xdisplay.Display()
+        self._root = self._display.screen().root
 
-    def stop(self):
-        if self._monitor_proc:
-            self._monitor_proc.terminate()
-            self._monitor_proc = None
-        self._unregister_all()
-
-    def _read_signals(self):
-        """Parse dbus-monitor output for shortcut activations."""
-        proc = self._monitor_proc
-        if not proc or not proc.stdout:
-            return
-
-        # dbus-monitor outputs signal blocks like:
-        #   signal time=... sender=... -> dest=... path=/component/local_voice_scribe
-        #     interface=org.kde.kglobalaccel.Component member=globalShortcutPressed
-        #     string "local-voice-scribe"
-        #     string "super_alt_r"
-        #     int64 1234567890
-        collecting = False
-        action_name = None
-
-        for line in proc.stdout:
-            line = line.strip()
-            if "member=globalShortcutPressed" in line:
-                collecting = True
-                action_name = None
+        # Resolve key names to keycodes and set up grabs
+        resolved = {}
+        for (mod_mask, key_name), callback in self._callbacks.items():
+            keysym = XK.string_to_keysym(key_name)
+            if keysym == 0:
+                # Try uppercase for single letters
+                keysym = XK.string_to_keysym(key_name.upper())
+            if keysym == 0:
+                continue
+            keycode = self._display.keysym_to_keycode(keysym)
+            if keycode == 0:
                 continue
 
-            if collecting and line.startswith("string "):
-                # Extract the string value between quotes
-                val = line.split('"')[1] if '"' in line else ""
-                if action_name is None:
-                    # First string is component name, skip it
-                    action_name = ""  # sentinel
-                elif action_name == "":
-                    # Second string is the action name
-                    action_name = val
-                    collecting = False
-                    cb = self._callbacks.get(action_name)
-                    if cb:
-                        threading.Thread(target=cb, daemon=True).start()
+            # Grab with all lock-mask combinations
+            for lock_mask in _LOCK_MASKS:
+                self._root.grab_key(
+                    keycode,
+                    mod_mask | lock_mask,
+                    True,  # owner_events
+                    X.GrabModeAsync,
+                    X.GrabModeAsync,
+                )
 
-            if not line and collecting:
-                # Empty line = end of signal block
-                collecting = False
+            resolved[(mod_mask, keycode)] = callback
 
-    def _unregister_all(self):
-        for action_name in self._callbacks:
+        self._callbacks_resolved = resolved
+        self._display.flush()
+
+        self._running = True
+        self._thread = threading.Thread(target=self._event_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._display:
+            # Ungrab all keys
+            for (mod_mask, keycode) in self._callbacks_resolved:
+                for lock_mask in _LOCK_MASKS:
+                    try:
+                        self._root.ungrab_key(keycode, mod_mask | lock_mask)
+                    except Exception:
+                        pass
             try:
-                subprocess.run([
-                    "qdbus", "org.kde.kglobalaccel", "/kglobalaccel",
-                    "org.kde.KGlobalAccel.setInactive",
-                    self.COMPONENT, action_name, "Local Voice Scribe", action_name,
-                ], capture_output=True, timeout=5)
+                self._display.flush()
+                self._display.close()
             except Exception:
                 pass
+            self._display = None
+
+    def _event_loop(self):
+        """Listen for X11 KeyPress events on grabbed keys."""
+        while self._running:
+            try:
+                # Check for pending events with a timeout
+                if self._display.pending_events():
+                    event = self._display.next_event()
+                    if event.type == X.KeyPress:
+                        # Strip lock masks to match our registered combos
+                        clean_mask = event.state & ~(X.LockMask | X.Mod2Mask)
+                        key = (clean_mask, event.detail)
+                        cb = self._callbacks_resolved.get(key)
+                        if cb:
+                            threading.Thread(target=cb, daemon=True).start()
+                else:
+                    # No events pending, sleep briefly to avoid busy-wait
+                    import time
+                    time.sleep(0.05)
+            except Exception:
+                if self._running:
+                    import time
+                    time.sleep(0.1)
 
 
 # ─── pynput fallback ───
@@ -249,12 +246,12 @@ class _PynputHotkeyManager:
 # ─── Public API ───
 
 class HotkeyManager:
-    """Unified hotkey manager — uses KDE kglobalaccel if available, pynput otherwise."""
+    """Unified hotkey manager — uses X11 XGrabKey if available, pynput otherwise."""
 
     def __init__(self):
-        if _USE_KDE:
-            self._backend = _KDEHotkeyManager()
-            self._backend_name = "kde-dbus"
+        if _USE_XLIB:
+            self._backend = _X11HotkeyManager()
+            self._backend_name = "x11-grab"
         elif _USE_PYNPUT:
             self._backend = _PynputHotkeyManager()
             self._backend_name = "pynput"

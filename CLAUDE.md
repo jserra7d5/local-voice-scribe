@@ -77,7 +77,7 @@ ffmpeg MUST be terminated with SIGINT (not SIGKILL/terminate). SIGKILL produces 
 
 The Linux daemon (`linux/`) is a Python package mirroring the macOS init.lua feature set:
 - `daemon.py` — state machine (idle → recording → transcribing → complete → idle) with session IDs
-- `hotkeys.py` — pynput-based global hotkey listener (no Qt dependency)
+- `hotkeys.py` — X11 XGrabKey via python-xlib (pynput fallback)
 - `recorder.py` — ffmpeg recording via PulseAudio backend with Focusrite auto-detection
 - `server.py` — whisper-server lifecycle (launch, health check, idle shutdown)
 - `transcriber.py` — HTTP POST to whisper-server `/inference` endpoint

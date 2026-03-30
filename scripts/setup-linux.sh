@@ -105,6 +105,7 @@ check_system_packages() {
     "notify-send:libnotify-bin"
     "pactl:pulseaudio-utils"
     "lsof:lsof"
+    "xdg-open:xdg-utils"
   )
 
   for entry in "${pkg_map[@]}"; do
@@ -211,16 +212,27 @@ write_runtime_config() {
   local install_token="$1"
   local audio_device="$2"
   mkdir -p "$CONFIG_DIR"
-  cat > "$RUNTIME_JSON" <<EOF
-{
-    "ffmpeg_path": "$(command -v ffmpeg)",
-    "whisper_server_path": "$WHISPER_SERVER_DEST",
-    "model_path": "$MODEL_PATH",
-    "install_token": "$install_token",
-    "repo_root": "$REPO_ROOT",
-    "audio_device": $([ -n "$audio_device" ] && printf '"%s"' "$audio_device" || printf 'null')
+  # Use Python to generate valid JSON (handles special chars in paths safely)
+  "$PYTHON_BIN" -c "
+import json, sys
+data = {
+    'ffmpeg_path': sys.argv[1],
+    'whisper_server_path': sys.argv[2],
+    'model_path': sys.argv[3],
+    'install_token': sys.argv[4],
+    'repo_root': sys.argv[5],
+    'audio_device': sys.argv[6] if sys.argv[6] else None,
 }
-EOF
+with open(sys.argv[7], 'w') as f:
+    json.dump(data, f, indent=4)
+" \
+    "$(command -v ffmpeg)" \
+    "$WHISPER_SERVER_DEST" \
+    "$MODEL_PATH" \
+    "$install_token" \
+    "$REPO_ROOT" \
+    "${audio_device:-}" \
+    "$RUNTIME_JSON"
   log "Runtime config written to $RUNTIME_JSON"
 }
 
@@ -228,6 +240,7 @@ create_launcher_script() {
   cat > "$LAUNCHER_SCRIPT" <<EOF
 #!/usr/bin/env bash
 # Local Voice Scribe - Linux launcher
+cd "$REPO_ROOT" || exit 1
 exec "$VENV_DIR/bin/python3" -m linux "\$@"
 EOF
   chmod +x "$LAUNCHER_SCRIPT"
@@ -236,12 +249,15 @@ EOF
 
 create_desktop_entry() {
   mkdir -p "$(dirname "$DESKTOP_FILE")"
+  # Exec= in .desktop files: quote the path if it contains spaces
+  local escaped_launcher
+  escaped_launcher="$(printf '%s' "$LAUNCHER_SCRIPT" | sed 's/ /\\ /g')"
   cat > "$DESKTOP_FILE" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Local Voice Scribe
 Comment=Local voice recording and transcription
-Exec=$LAUNCHER_SCRIPT
+Exec=${escaped_launcher}
 Terminal=false
 Categories=Audio;Utility;
 StartupNotify=false
@@ -251,12 +267,14 @@ EOF
 
 create_autostart_entry() {
   mkdir -p "$(dirname "$AUTOSTART_FILE")"
+  local escaped_launcher
+  escaped_launcher="$(printf '%s' "$LAUNCHER_SCRIPT" | sed 's/ /\\ /g')"
   cat > "$AUTOSTART_FILE" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Local Voice Scribe
 Comment=Local voice recording and transcription
-Exec=$LAUNCHER_SCRIPT
+Exec=${escaped_launcher}
 Terminal=false
 Categories=Audio;Utility;
 StartupNotify=false
@@ -283,6 +301,7 @@ doctor() {
 
   [ -d "$VENV_DIR" ] || die "Python venv missing at $VENV_DIR"
   "$VENV_DIR/bin/python3" -c "import pynput" 2>/dev/null || die "pynput not installed in venv"
+  "$VENV_DIR/bin/python3" -c "import PyQt6" 2>/dev/null || log "Warning: PyQt6 not installed in venv (overlay will be disabled)"
 
   install_token="$(python3 -c "import json; print(json.load(open('$RUNTIME_JSON')).get('install_token',''))" 2>/dev/null || true)"
   [ -n "$install_token" ] || die "Missing install_token in $RUNTIME_JSON"

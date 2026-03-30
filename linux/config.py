@@ -35,7 +35,7 @@ DEFAULTS = {
 # Keys that are managed by the installer, not the user
 RUNTIME_OWNED_KEYS = {
     "ffmpeg_path", "whisper_server_path", "model_path",
-    "install_token", "repo_root", "audio_device",
+    "install_token", "repo_root",
 }
 
 

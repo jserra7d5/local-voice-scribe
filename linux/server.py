@@ -10,6 +10,8 @@ import urllib.request
 from . import config as cfg
 from .notifications import notify
 
+PID_FILE = cfg.CONFIG_DIR / "whisper-server.pid"
+
 
 class WhisperServer:
     """Manages the whisper-server process with idle auto-shutdown."""
@@ -54,8 +56,8 @@ class WhisperServer:
             return
 
         self.log("launching new server")
-        # Kill any stale process on the port
-        self._kill_port()
+        # Kill only our own stale process via PID file
+        self._kill_owned_server()
 
         cmd = [
             server_path,
@@ -66,14 +68,23 @@ class WhisperServer:
         ]
         self.log(f"server cmd: {' '.join(cmd)}")
 
-        with self._lock:
-            self._process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        self.log(f"server started pid={self._process.pid}")
-        self.reset_idle_timer()
+        try:
+            with self._lock:
+                self._process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            self._write_pid(self._process.pid)
+            self.log(f"server started pid={self._process.pid}")
+
+            # Start a reaper thread to detect early server death
+            threading.Thread(target=self._reaper, daemon=True).start()
+
+            self.reset_idle_timer()
+        except OSError as e:
+            self.log(f"failed to start whisper-server: {e}")
+            notify(f"whisper-server failed to start: {e}", title="Error")
 
     def stop(self):
         """Stop the whisper-server and cancel idle timer."""
@@ -90,7 +101,7 @@ class WhisperServer:
                     except Exception:
                         pass
                 self._process = None
-        self._kill_port()
+        self._remove_pid()
 
     def reset_idle_timer(self):
         """Reset the idle shutdown timer."""
@@ -123,18 +134,51 @@ class WhisperServer:
         self.log("idle timeout — shutting down server")
         self.stop()
 
-    def _kill_port(self):
-        """Kill any process listening on the whisper server port."""
+    def _reaper(self):
+        """Wait for the server process to exit and clean up."""
+        proc = self._process
+        if not proc:
+            return
+        exit_code = proc.wait()
+        self.log(f"whisper-server exited: {exit_code}")
+        with self._lock:
+            if self._process is proc:
+                self._process = None
+        self._remove_pid()
+
+    def _write_pid(self, pid: int):
         try:
-            result = subprocess.run(
-                ["lsof", "-ti", f":{cfg.WHISPER_SERVER_PORT}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.stdout.strip():
-                for pid in result.stdout.strip().split("\n"):
-                    try:
-                        os.kill(int(pid), signal.SIGKILL)
-                    except (ValueError, OSError):
-                        pass
-        except Exception:
+            PID_FILE.write_text(str(pid))
+        except OSError:
             pass
+
+    def _remove_pid(self):
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _kill_owned_server(self):
+        """Kill a previously-launched server using the PID file (not port scan)."""
+        if not PID_FILE.exists():
+            return
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            # Verify it's actually a whisper-server before killing
+            cmdline_path = f"/proc/{pid}/cmdline"
+            if os.path.exists(cmdline_path):
+                with open(cmdline_path, "rb") as f:
+                    cmdline = f.read().decode("utf-8", errors="replace")
+                if "whisper-server" in cmdline:
+                    self.log(f"killing stale whisper-server pid={pid}")
+                    os.kill(pid, signal.SIGTERM)
+                    time.sleep(0.5)
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                else:
+                    self.log(f"stale PID {pid} is not whisper-server, ignoring")
+        except (ValueError, OSError):
+            pass
+        self._remove_pid()

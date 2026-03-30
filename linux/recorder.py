@@ -4,7 +4,6 @@ import os
 import signal
 import subprocess
 import threading
-import time
 
 from . import config as cfg
 
@@ -43,7 +42,7 @@ class Recorder:
         self.config = app_config
         self.log = log_fn
         self._process: subprocess.Popen | None = None
-        self._safety_timer: threading.Timer | None = None
+        self._force_killed = False
 
     @property
     def audio_device(self) -> str:
@@ -58,8 +57,12 @@ class Recorder:
         self.log("no Focusrite found, using default")
         return "default"
 
-    def start(self) -> bool:
-        """Start recording. Returns True on success."""
+    def start(self, on_crash_callback=None) -> bool:
+        """Start recording. Returns True on success.
+
+        If on_crash_callback is provided, it will be called if ffmpeg exits
+        unexpectedly (not via stop()).
+        """
         ffmpeg = self.config.get("ffmpeg_path") or "ffmpeg"
         if not os.path.exists(ffmpeg) and ffmpeg != "ffmpeg":
             self.log(f"ffmpeg not found: {ffmpeg}")
@@ -69,6 +72,7 @@ class Recorder:
         if cfg.TEMP_AUDIO_FILE.exists():
             cfg.TEMP_AUDIO_FILE.unlink()
 
+        self._force_killed = False
         device = self.audio_device
         cmd = [
             ffmpeg, "-y",
@@ -88,13 +92,22 @@ class Recorder:
                 stderr=subprocess.DEVNULL,
             )
             self.log(f"ffmpeg started pid={self._process.pid}")
+
+            # Monitor for unexpected crashes
+            if on_crash_callback:
+                threading.Thread(
+                    target=self._crash_monitor,
+                    args=(self._process, on_crash_callback),
+                    daemon=True,
+                ).start()
+
             return True
         except OSError as e:
             self.log(f"ffmpeg start failed: {e}")
             return False
 
     def stop(self, on_exit_callback=None):
-        """Stop recording with SIGINT (not SIGKILL). Calls callback when ffmpeg exits."""
+        """Stop recording with SIGINT (not SIGKILL). Calls callback when ffmpeg exits cleanly."""
         if not self._process:
             return
 
@@ -109,25 +122,41 @@ class Recorder:
         # Wait for exit in a thread so we don't block
         def _wait():
             proc = self._process
+            was_force_killed = False
             try:
                 proc.wait(timeout=2)
                 self.log(f"ffmpeg exited cleanly: {proc.returncode}")
             except subprocess.TimeoutExpired:
                 self.log("ffmpeg safety timeout — force killing")
+                was_force_killed = True
+                self._force_killed = True
                 try:
                     proc.kill()
                     proc.wait(timeout=1)
                 except Exception:
                     pass
-            finally:
-                self._process = None
-                if self._safety_timer:
-                    self._safety_timer.cancel()
-                    self._safety_timer = None
-                if on_exit_callback:
-                    on_exit_callback()
+
+            self._process = None
+
+            # Only invoke transcription callback if ffmpeg exited via SIGINT (clean WAV)
+            # If we had to SIGKILL, the WAV is likely corrupt
+            if on_exit_callback and not was_force_killed:
+                on_exit_callback()
+            elif was_force_killed and on_exit_callback:
+                self.log("skipping transcription callback — ffmpeg was force-killed (WAV likely corrupt)")
+                # Still call it but the file size check in transcriber will catch bad files
 
         threading.Thread(target=_wait, daemon=True).start()
+
+    def _crash_monitor(self, proc: subprocess.Popen, callback):
+        """Wait for process to exit; if it wasn't stopped intentionally, call crash callback."""
+        proc.wait()
+        # Only fire crash callback if we still hold this process reference
+        # (stop() clears self._process, so if it's still set, this was unexpected)
+        if self._process is proc:
+            self._process = None
+            self.log(f"ffmpeg crashed unexpectedly: exit={proc.returncode}")
+            callback()
 
     @property
     def is_recording(self) -> bool:

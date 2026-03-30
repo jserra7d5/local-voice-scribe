@@ -142,7 +142,9 @@ class Daemon:
         self.server.launch_if_needed()
         self.server.suspend_idle_timer()  # launch arms it, suspend again
 
-        if not self.recorder.start():
+        gen = self._session_id
+
+        if not self.recorder.start(on_crash_callback=lambda: self._on_ffmpeg_crash(gen)):
             notify("Recording failed (could not start ffmpeg)", title="Error")
             self.update_state("idle")
             self.server.reset_idle_timer()
@@ -248,6 +250,14 @@ class Daemon:
         if gen == self._session_id:
             self.update_state("idle")
 
+    def _on_ffmpeg_crash(self, gen: int):
+        """Handle unexpected ffmpeg exit while still in recording state."""
+        if gen != self._session_id:
+            return
+        if self._state == "recording":
+            self.log("ffmpeg crashed unexpectedly during recording")
+            self._finish_transcription("Recording failed (ffmpeg crashed)")
+
     def _finish_transcription(self, message: str):
         """Clean up after a failed or empty transcription."""
         if cfg.TEMP_AUDIO_FILE.exists():
@@ -330,6 +340,10 @@ class Daemon:
     def _cleanup(self):
         self.log("daemon cleanup")
         self.hotkeys.stop()
+        # Stop ffmpeg if still recording
+        if self.recorder.is_recording:
+            self.log("stopping ffmpeg on shutdown")
+            self.recorder.stop()
         self.server.stop()
         self.update_state("idle")
         self.log("daemon stopped")

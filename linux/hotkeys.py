@@ -1,6 +1,7 @@
 """Global hotkey manager using pynput (no Qt dependency)."""
 
 import threading
+import time
 from typing import Callable
 
 from pynput import keyboard

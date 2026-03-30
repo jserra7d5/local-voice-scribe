@@ -1,16 +1,23 @@
-"""PyQt6 floating recording indicator and dictionary editor."""
+"""PyQt6 screen border overlay and dictionary editor."""
 
 import sys
-import threading
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMetaObject, Q_ARG
-from PyQt6.QtGui import QColor, QPainter, QPen, QBrush, QCursor, QFont
+from PyQt6.QtCore import Qt, QTimer, QRect, pyqtSignal, QObject
+from PyQt6.QtGui import QColor, QPainter, QBrush, QCursor, QFont, QRegion
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QDialog, QVBoxLayout, QHBoxLayout,
     QTextEdit, QPushButton, QLabel,
 )
 
 from . import config as cfg
+
+BORDER_THICKNESS = 6
+
+BORDER_COLORS = {
+    "recording": QColor(255, 40, 40),
+    "transcribing": QColor(255, 200, 0),
+    "complete": QColor(40, 220, 40),
+}
 
 
 class StateSignal(QObject):
@@ -20,23 +27,17 @@ class StateSignal(QObject):
     quit_signal = pyqtSignal()
 
 
-class RecordingIndicator(QWidget):
-    """Floating recording dot at bottom-center of screen."""
-
-    COLORS = {
-        "recording": QColor(255, 40, 40),
-        "transcribing": QColor(255, 200, 0),
-        "complete": QColor(40, 220, 40),
-    }
+class BorderOverlay(QWidget):
+    """Full-screen border effect on the active monitor, matching Hammerspoon's hs.canvas borders."""
 
     def __init__(self):
         super().__init__()
         self._state = "idle"
-        self._pulse_alpha = 255
-        self._pulse_direction = -1
-        self._dot_size = 20
+        self._alpha = 230
+        self._color = QColor(0, 0, 0, 0)
+        self._fade_step = 0
+        self._fade_gen = 0
 
-        # Frameless, always-on-top, translucent, click-through
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -45,76 +46,86 @@ class RecordingIndicator(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
-        self.setFixedSize(self._dot_size + 4, self._dot_size + 4)
-
-        # Pulse animation timer
-        self._pulse_timer = QTimer(self)
-        self._pulse_timer.timeout.connect(self._pulse_tick)
+        # Fade-out timer for flash effects
+        self._fade_timer = QTimer(self)
+        self._fade_timer.timeout.connect(self._fade_tick)
 
         # Auto-hide timer for complete state
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
-        self._hide_timer.timeout.connect(self._on_hide_timeout)
+        self._hide_timer.timeout.connect(self._on_complete_done)
 
     def set_state(self, state: str):
         self._state = state
+        self._fade_timer.stop()
+
         if state == "recording":
-            self._reposition()
-            self.show()
-            self._pulse_alpha = 255
-            self._pulse_timer.start(50)
-            self._hide_timer.stop()
+            self._show_border(BORDER_COLORS["recording"], persistent=True)
         elif state == "transcribing":
-            self._pulse_timer.stop()
-            self._pulse_alpha = 255
-            self.update()
-            self.show()
-            self._hide_timer.stop()
+            self._show_border(BORDER_COLORS["transcribing"], persistent=False)
         elif state == "complete":
-            self._pulse_timer.stop()
-            self._pulse_alpha = 255
-            self.update()
-            self.show()
-            self._hide_timer.start(2000)
+            self._show_border(BORDER_COLORS["complete"], persistent=False)
         else:
-            self._pulse_timer.stop()
-            self._hide_timer.stop()
-            self.hide()
+            self._clear()
 
-    def _reposition(self):
-        """Position on the screen where the cursor currently is."""
+    def _show_border(self, color: QColor, persistent: bool):
+        """Position on active screen, set up the border mask, and show."""
+        self._hide_timer.stop()
+        self._fade_timer.stop()
+
         screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
-        if screen:
-            geo = screen.availableGeometry()
-            x = geo.x() + (geo.width() - self.width()) // 2
-            y = geo.y() + geo.height() - self.height() - 40
-            self.move(x, y)
+        if not screen:
+            return
 
-    def _pulse_tick(self):
-        self._pulse_alpha += self._pulse_direction * 15
-        if self._pulse_alpha <= 80:
-            self._pulse_alpha = 80
-            self._pulse_direction = 1
-        elif self._pulse_alpha >= 255:
-            self._pulse_alpha = 255
-            self._pulse_direction = -1
+        geo = screen.geometry()
+        self.setGeometry(geo)
+
+        # Build a mask that is only the border strips (hollow rectangle)
+        t = BORDER_THICKNESS
+        outer = QRegion(0, 0, geo.width(), geo.height())
+        inner = QRegion(t, t, geo.width() - 2 * t, geo.height() - 2 * t)
+        self.setMask(outer.subtracted(inner))
+
+        self._color = QColor(color)
+        self._alpha = 230
+        self._color.setAlpha(self._alpha)
+        self.update()
+        self.show()
+
+        if not persistent:
+            # Fade out over ~550ms
+            self._fade_gen += 1
+            self._fade_step = 0
+            self._fade_timer.start(50)
+
+    def _fade_tick(self):
+        self._fade_step += 1
+        total_steps = 11
+        if self._fade_step >= total_steps:
+            self._fade_timer.stop()
+            if self._state == "complete":
+                self._hide_timer.start(200)
+            else:
+                self._clear()
+            return
+        self._alpha = int(230 * (1 - self._fade_step / total_steps))
+        self._color.setAlpha(max(0, self._alpha))
         self.update()
 
-    def _on_hide_timeout(self):
+    def _on_complete_done(self):
+        self._clear()
+
+    def _clear(self):
+        self._fade_timer.stop()
+        self._hide_timer.stop()
         self.hide()
 
     def paintEvent(self, event):
-        if self._state not in self.COLORS:
-            return
-        color = QColor(self.COLORS[self._state])
-        color.setAlpha(self._pulse_alpha)
-
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(color))
-        painter.drawEllipse(2, 2, self._dot_size, self._dot_size)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.fillRect(self.rect(), self._color)
         painter.end()
 
 
@@ -203,7 +214,7 @@ class DictionaryEditor(QDialog):
 
 
 class OverlayApp:
-    """Manages the Qt application, recording indicator, and dictionary editor."""
+    """Manages the Qt application, border overlay, and dictionary editor."""
 
     def __init__(self, daemon):
         self._daemon = daemon
@@ -211,10 +222,10 @@ class OverlayApp:
         self._app.setQuitOnLastWindowClosed(False)
 
         self._signals = StateSignal()
-        self._indicator = RecordingIndicator()
+        self._border = BorderOverlay()
         self._editor = DictionaryEditor()
 
-        self._signals.state_changed.connect(self._indicator.set_state)
+        self._signals.state_changed.connect(self._border.set_state)
         self._signals.show_editor.connect(self._editor.open_editor)
         self._signals.quit_signal.connect(self._app.quit)
 

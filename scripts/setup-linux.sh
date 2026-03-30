@@ -103,7 +103,8 @@ detect_cuda_arch() {
 
 detect_focusrite() {
   if command -v pactl >/dev/null 2>&1; then
-    pactl list sources short 2>/dev/null | grep -i 'scarlett\|focusrite' | grep -i 'analog.stereo' | awk '{print $2}' | head -1
+    # Match input sources only (alsa_input.*), not output monitors (alsa_output.*.monitor)
+    pactl list sources short 2>/dev/null | grep -i 'scarlett\|focusrite' | grep 'alsa_input\.' | awk '{print $2}' | head -1
   fi
 }
 

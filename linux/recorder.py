@@ -15,19 +15,13 @@ def detect_focusrite() -> str | None:
             ["pactl", "list", "sources", "short"],
             capture_output=True, text=True, timeout=5,
         )
+        # Filter for input sources only (alsa_input.*), not output monitors
         for line in result.stdout.splitlines():
             parts = line.split("\t")
             if len(parts) >= 2:
                 source_name = parts[1]
-                if "scarlett" in source_name.lower() or "focusrite" in source_name.lower():
-                    # Prefer "analog-stereo" variant
-                    if "analog-stereo" in source_name.lower():
-                        return source_name
-        # Second pass: any Focusrite/Scarlett source
-        for line in result.stdout.splitlines():
-            parts = line.split("\t")
-            if len(parts) >= 2:
-                source_name = parts[1]
+                if not source_name.startswith("alsa_input."):
+                    continue
                 if "scarlett" in source_name.lower() or "focusrite" in source_name.lower():
                     return source_name
     except Exception:

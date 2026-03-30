@@ -101,6 +101,7 @@ class Daemon:
             f"Transcripts: {trans_display}",
             title="Local Voice Scribe ready",
         )
+        self.log(f"hotkey backend: {self.hotkeys.backend_name}")
         self.log(f"hotkeys: record={rec_display}, dict={dict_display}, transcripts={trans_display}")
 
         # If overlay is running, it has its own event loop (Qt)

@@ -363,7 +363,8 @@ doctor() {
   [ "$(sha256_file "$runtime_model")" = "$MODEL_SHA256" ] || die "Model checksum mismatch at $runtime_model"
 
   [ -d "$VENV_DIR" ] || die "Python venv missing at $VENV_DIR"
-  "$VENV_DIR/bin/python3" -c "import pynput" 2>/dev/null || die "pynput not installed in venv"
+  "$VENV_DIR/bin/python3" -c "from Xlib import X" 2>/dev/null || warn "python-xlib not installed in venv (hotkeys will fall back to pynput which may leak keystrokes)"
+  "$VENV_DIR/bin/python3" -c "import pynput" 2>/dev/null || warn "pynput not installed in venv (no fallback hotkey backend)"
   "$VENV_DIR/bin/python3" -c "import PyQt6" 2>/dev/null || warn "PyQt6 not installed in venv (border overlay will be disabled)"
 
   command -v nvidia-smi >/dev/null 2>&1 || warn "nvidia-smi not found (GPU acceleration may not work)"

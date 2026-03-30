@@ -4,7 +4,7 @@ import sys
 import threading
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMetaObject, Q_ARG
-from PyQt6.QtGui import QColor, QPainter, QPen, QBrush, QFont
+from PyQt6.QtGui import QColor, QPainter, QPen, QBrush, QCursor, QFont
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QDialog, QVBoxLayout, QHBoxLayout,
     QTextEdit, QPushButton, QLabel,
@@ -60,7 +60,7 @@ class RecordingIndicator(QWidget):
     def set_state(self, state: str):
         self._state = state
         if state == "recording":
-            self._position_on_screen()
+            self._reposition()
             self.show()
             self._pulse_alpha = 255
             self._pulse_timer.start(50)
@@ -82,8 +82,9 @@ class RecordingIndicator(QWidget):
             self._hide_timer.stop()
             self.hide()
 
-    def _position_on_screen(self):
-        screen = QApplication.primaryScreen()
+    def _reposition(self):
+        """Position on the screen where the cursor currently is."""
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         if screen:
             geo = screen.availableGeometry()
             x = geo.x() + (geo.width() - self.width()) // 2

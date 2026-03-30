@@ -1,10 +1,10 @@
 # Local Voice Scribe
 
-Hammerspoon-based local voice recording and transcription using `whisper.cpp`.
+Local voice recording and transcription using `whisper.cpp`. Supports macOS (Hammerspoon) and Linux (Python daemon).
 
 ## One-command setup
 
-Assuming the repo is already cloned:
+### macOS
 
 ```bash
 ./scripts/setup.sh --yes
@@ -21,7 +21,25 @@ The setup script will:
 - restart Hammerspoon and verify the expected install token is live
 - verify the status API and `whisper-server`
 
+### Linux
+
+```bash
+./scripts/setup-linux.sh --yes
+```
+
+The setup script will:
+
+- check for required system packages (`ffmpeg`, `cmake`, `curl`, `xclip`, `nvidia-cuda-toolkit`, etc.)
+- download and verify the `ggml-large-v3-turbo` model
+- download and build a pinned `whisper.cpp` release with CUDA support
+- create a Python virtual environment with `pynput` and `PyQt6`
+- detect the Focusrite Scarlett audio device (if connected)
+- write `~/.local-voice-scribe/runtime.json`
+- create XDG desktop and autostart entries
+
 ## What gets installed
+
+### macOS
 
 - Hammerspoon app via Homebrew cask
 - `ffmpeg` formula for recording from the default input device
@@ -30,6 +48,17 @@ The setup script will:
 - installer-managed runtime config at `~/.local-voice-scribe/runtime.lua`
 - source-built `whisper-server` at `~/.local-voice-scribe/whisper/bin/whisper-server`
 - copied server public assets at `~/.local-voice-scribe/whisper/public`
+
+### Linux
+
+- `ffmpeg` for recording via PulseAudio/PipeWire
+- `cmake` for building `whisper.cpp`
+- model file at `~/.local-voice-scribe/models/ggml-large-v3-turbo.bin`
+- installer-managed runtime config at `~/.local-voice-scribe/runtime.json`
+- source-built `whisper-server` (CUDA) at `~/.local-voice-scribe/whisper/bin/whisper-server`
+- Python venv at `~/.local-voice-scribe/venv/`
+- launcher script at `local-voice-scribe-linux` (project root)
+- XDG desktop entry and autostart entry
 
 ## User-managed files
 
@@ -72,12 +101,24 @@ For a non-mutating verification pass:
 
 ## How it works
 
+### macOS
 - `Cmd+Alt+R` toggles recording
 - `Cmd+Alt+C` opens the floating dictionary editor
 - `Cmd+Alt+T` opens the transcript temp folder in Finder
 - Hammerspoon starts `whisper-server` on load and shuts it down after an idle timeout
+
+### Linux
+- `Super+Alt+R` toggles recording
+- `Super+Alt+C` opens the dictionary editor
+- `Super+Alt+T` opens the transcript folder in the file manager
+- Daemon starts `whisper-server` on launch and shuts it down after idle timeout
+- Floating red dot indicator during recording (PyQt6)
+
+### Both platforms
 - Successful transcriptions are copied to the clipboard and archived under `/tmp/local-voice-scribe-transcripts`
-- Status API runs on `http://127.0.0.1:8989/state`
+- whisper-server keeps the model loaded in GPU memory for sub-second transcription latency
+- Dictionary words bias whisper spelling; `wrong -> right` rules post-process the output
+- User config: `~/.local-voice-scribe/config.json` (Linux) or `config.lua` (macOS)
 
 ## Troubleshooting
 

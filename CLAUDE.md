@@ -1,29 +1,51 @@
 # Local Voice Scribe
 
-Hammerspoon-based voice recording and transcription tool using whisper.cpp.
+Local voice recording and transcription tool using whisper.cpp. Dual-platform: macOS (Hammerspoon/Lua) and Linux (Python daemon).
 
 ## Setup
 
+### macOS
 - Bootstrap with `./scripts/setup.sh --yes`
 - Verify with `./scripts/setup.sh --doctor`
-- `init.lua` is the main (and only) script
+- `init.lua` is the macOS entry point (Hammerspoon)
 - Hammerspoon loads this repo through a managed block in `~/.hammerspoon/init.lua`
-- Setup refuses to rewrite unmanaged `~/.hammerspoon/init.lua` files
 - Installer-managed runtime paths live in `~/.local-voice-scribe/runtime.lua`
 - User overrides live in `~/.local-voice-scribe/config.lua`
+
+### Linux
+- Bootstrap with `./scripts/setup-linux.sh --yes`
+- Verify with `./scripts/setup-linux.sh --doctor`
+- `linux/` package is the Linux entry point (Python daemon)
+- Run with `./local-voice-scribe-linux` or `python3 -m linux` from repo root
+- Installer-managed runtime paths live in `~/.local-voice-scribe/runtime.json`
+- User overrides live in `~/.local-voice-scribe/config.json`
+- Python venv at `~/.local-voice-scribe/venv/`
+- Requires NVIDIA GPU with CUDA for whisper-server acceleration
+- Auto-detects Focusrite Scarlett via PipeWire/PulseAudio
+
+### Shared
 - Model: `ggml-large-v3-turbo` at `~/.local-voice-scribe/models/ggml-large-v3-turbo.bin`
 - Source-built `whisper-server`: `~/.local-voice-scribe/whisper/bin/whisper-server`
-- Whisper public assets: `~/.local-voice-scribe/whisper/public`
-- Requires `ffmpeg`, `cmake`, and `Hammerspoon`, installed by `scripts/setup.sh`
+- Dictionary: `~/.local-voice-scribe/dictionary.txt`
 
 ## How it works
 
+### macOS hotkeys
 - **Cmd+Alt+R** toggles recording on/off
+- **Cmd+Alt+C** opens dictionary editor
 - **Cmd+Alt+T** opens the transcript temp folder
-- Records from the system default audio input device via ffmpeg/avfoundation
-- Transcribes via whisper-server HTTP API, copies result to clipboard, and archives successful transcripts to a temp folder
-- Server auto-starts on Hammerspoon load, shuts down after 5 min idle (configurable)
-- Exposes a status HTTP API on port 8989 (`/state`, `/toggle`)
+
+### Linux hotkeys
+- **Super+Alt+R** toggles recording on/off
+- **Super+Alt+C** opens dictionary editor
+- **Super+Alt+T** opens the transcript folder
+
+### Both platforms
+- Records from audio input via ffmpeg (avfoundation on macOS, pulse on Linux)
+- Transcribes via whisper-server HTTP API on port 8178
+- Copies result to clipboard, archives to `/tmp/local-voice-scribe-transcripts/`
+- Server auto-starts, shuts down after 5 min idle (configurable)
+- macOS exposes a status HTTP API on port 8989 (`/state`, `/toggle`)
 
 ## Features
 
@@ -34,13 +56,33 @@ Hammerspoon-based voice recording and transcription tool using whisper.cpp.
 
 ## User config: `~/.local-voice-scribe/`
 
-- **`config.lua`** (optional) — returns a Lua table to override behavior settings such as `duck_enabled`, `duck_level`, `duck_ramp_down`, `duck_ramp_up`, `server_idle_timeout`, `hotkey_toggle_recording`, `hotkey_dictionary_editor`, and `hotkey_open_transcripts`. Installer-owned path keys in this file are ignored.
-- **`runtime.lua`** (installer-managed) — returns a Lua table with resolved paths for `ffmpeg_path`, `whisper_server_path`, `whisper_public_path`, `model_path`, `install_token`, `repo_root`, and `ggml_metal_path_resources`.
-- **`dictionary.txt`** — one word per line, fed to whisper as `initial_prompt` to bias spelling of proper nouns (e.g., Quantiiv). Edited via **Cmd+Alt+C** floating editor. Read fresh from disk on each transcription.
+### macOS
+- **`config.lua`** (optional) — Lua table overriding behavior settings (`duck_enabled`, `server_idle_timeout`, hotkey bindings, etc.)
+- **`runtime.lua`** (installer-managed) — resolved paths for `ffmpeg_path`, `whisper_server_path`, `model_path`, etc.
+
+### Linux
+- **`config.json`** (optional) — JSON object overriding behavior settings (`server_idle_timeout`, hotkey bindings, `audio_device`, etc.)
+- **`runtime.json`** (installer-managed) — resolved paths for `ffmpeg_path`, `whisper_server_path`, `model_path`, `audio_device`, etc.
+
+### Shared
+- **`dictionary.txt`** — one word per line, fed to whisper as `initial_prompt` to bias spelling of proper nouns (e.g., Quantiiv). Supports `wrong -> right` replacement rules. Edited via hotkey editor. Read fresh from disk on each transcription.
 
 ## Important: ffmpeg termination
 
-ffmpeg MUST be terminated with SIGINT (not SIGKILL/terminate). SIGKILL produces an empty WAV file with no header, causing whisper to hallucinate "thank you." from silence. `hs.task:terminate()` sends SIGKILL — use `kill -INT <pid>` instead.
+ffmpeg MUST be terminated with SIGINT (not SIGKILL/terminate). SIGKILL produces an empty WAV file with no header, causing whisper to hallucinate "thank you." from silence.
+- **macOS**: `hs.task:terminate()` sends SIGKILL — use `kill -INT <pid>` instead.
+- **Linux**: Use `subprocess.Popen.send_signal(signal.SIGINT)`, not `.kill()` or `.terminate()`.
+
+## Linux architecture
+
+The Linux daemon (`linux/`) is a Python package mirroring the macOS init.lua feature set:
+- `daemon.py` — state machine (idle → recording → transcribing → complete → idle) with session IDs
+- `hotkeys.py` — pynput-based global hotkey listener (no Qt dependency)
+- `recorder.py` — ffmpeg recording via PulseAudio backend with Focusrite auto-detection
+- `server.py` — whisper-server lifecycle (launch, health check, idle shutdown)
+- `transcriber.py` — HTTP POST to whisper-server `/inference` endpoint
+- `overlay.py` — PyQt6 floating recording indicator (red dot) + dictionary editor dialog
+- `config.py`, `clipboard.py`, `notifications.py` — system integration
 
 ## State files
 

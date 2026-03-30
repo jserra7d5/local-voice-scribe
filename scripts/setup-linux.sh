@@ -6,22 +6,32 @@ usage() {
 Usage: ./scripts/setup-linux.sh [--yes] [--doctor]
 
 Modes:
-  --yes     Skip the confirmation prompt for install/update mode
+  --yes     Skip all confirmation prompts
   --doctor  Validate the current install without changing it
 
 Install/update mode will:
-  - check for required system packages (ffmpeg, cmake, curl, etc.)
-  - download and verify the large-v3-turbo model
-  - download and build whisper.cpp with CUDA support
+  - install required system packages (ffmpeg, cmake, curl, etc.)
+  - download and verify the large-v3-turbo whisper model (~1.6 GB)
+  - download and build whisper.cpp with CUDA GPU acceleration
   - create a Python virtual environment with pynput and PyQt6
-  - detect the Focusrite Scarlett audio device
+  - detect audio input devices (Focusrite Scarlett if connected)
   - write ~/.local-voice-scribe/runtime.json
-  - create XDG desktop and autostart entries
+  - create desktop launcher and autostart entries
+
+Prerequisites:
+  - Ubuntu/Debian-based Linux (apt)
+  - NVIDIA GPU with proprietary drivers installed
+  - CUDA toolkit (installed automatically if missing)
+  - Python 3.10+ with venv support
 EOF
 }
 
 log() {
   printf '[setup] %s\n' "$*"
+}
+
+warn() {
+  printf '[setup] WARNING: %s\n' "$*" >&2
 }
 
 die() {
@@ -30,6 +40,7 @@ die() {
 }
 
 confirm() {
+  if [ "$AUTO_YES" -eq 1 ]; then return; fi
   local prompt="${1:-Proceed? [Y/n] }"
   local reply
   read -r -p "$prompt" reply
@@ -58,7 +69,7 @@ download_with_sha() {
   }
   trap cleanup_tmp_download RETURN
 
-  log "Downloading $(basename "$dest")"
+  log "Downloading $(basename "$dest")..."
   curl -fL --progress-bar "$url" -o "$tmp_file"
 
   actual_sha="$(sha256_file "$tmp_file")"
@@ -84,7 +95,9 @@ detect_cuda_arch() {
       return 0
     fi
   fi
-  # Default to Ada Lovelace (RTX 40xx)
+  # Fallback: common architectures
+  # 75 = Turing (RTX 20xx), 86 = Ampere (RTX 30xx), 89 = Ada (RTX 40xx)
+  warn "Could not detect GPU compute capability, defaulting to 89 (RTX 40xx)"
   printf '89\n'
 }
 
@@ -94,40 +107,60 @@ detect_focusrite() {
   fi
 }
 
-check_system_packages() {
-  local missing=()
-  local pkg_map=(
-    "ffmpeg:ffmpeg"
-    "cmake:cmake"
-    "curl:curl"
-    "xclip:xclip"
-    "xdotool:xdotool"
-    "notify-send:libnotify-bin"
-    "pactl:pulseaudio-utils"
-    "lsof:lsof"
-    "xdg-open:xdg-utils"
+# ─── System package management ───
+
+check_nvidia_driver() {
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    die "NVIDIA driver not found. Install your GPU's proprietary driver first:
+  Ubuntu:  sudo ubuntu-drivers install
+  Manual:  https://www.nvidia.com/Download/index.aspx
+
+Then rerun this script."
+  fi
+  local driver_version
+  driver_version="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"
+  log "NVIDIA driver: $driver_version"
+}
+
+install_system_packages() {
+  # Packages we need and their apt names
+  local -a needed=()
+  local -A pkg_for_cmd=(
+    [ffmpeg]=ffmpeg
+    [cmake]=cmake
+    [curl]=curl
+    [xclip]=xclip
+    [xdotool]=xdotool
+    [notify-send]=libnotify-bin
+    [pactl]=pulseaudio-utils
+    [lsof]=lsof
+    [xdg-open]=xdg-utils
+    [g++]=g++
+    [pkg-config]=pkg-config
   )
 
-  for entry in "${pkg_map[@]}"; do
-    local cmd="${entry%%:*}"
-    local pkg="${entry##*:}"
+  for cmd in "${!pkg_for_cmd[@]}"; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
-      missing+=("$pkg")
+      needed+=("${pkg_for_cmd[$cmd]}")
     fi
   done
 
-  # Check for CUDA toolkit
+  # CUDA toolkit
   if ! command -v nvcc >/dev/null 2>&1; then
-    missing+=("nvidia-cuda-toolkit")
+    needed+=(nvidia-cuda-toolkit)
   fi
 
-  if [ ${#missing[@]} -gt 0 ]; then
-    log "Missing packages: ${missing[*]}"
-    log "Install them with:"
-    log "  sudo apt install ${missing[*]}"
-    die "Required packages missing. Install them and rerun setup."
+  if [ ${#needed[@]} -eq 0 ]; then
+    log "All required system packages found."
+    return
   fi
-  log "All required system packages found."
+
+  log "Missing packages: ${needed[*]}"
+  log "Installing with apt..."
+  confirm "Run 'sudo apt install ${needed[*]}'? [Y/n] "
+  sudo apt update -qq
+  sudo apt install -y "${needed[@]}"
+  log "System packages installed."
 }
 
 check_python() {
@@ -139,9 +172,29 @@ check_python() {
     fi
   done
   [ -n "$py" ] || die "Python 3 not found. Install python3."
+
+  # Check version >= 3.10 (needed for X | Y union syntax)
+  local ver
+  ver="$("$py" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")"
+  local major minor
+  major="${ver%%.*}"
+  minor="${ver##*.}"
+  if [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -lt 10 ]; }; then
+    die "Python >= 3.10 required, found $ver"
+  fi
+
+  # Check venv module is available
+  if ! "$py" -m venv --help >/dev/null 2>&1; then
+    log "Python venv module missing. Installing python3-venv..."
+    confirm "Run 'sudo apt install python3-venv'? [Y/n] "
+    sudo apt install -y python3-venv
+  fi
+
   PYTHON_BIN="$py"
-  log "Using Python: $PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
+  log "Using Python: $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
 }
+
+# ─── Build and install ───
 
 ensure_model() {
   mkdir -p "$MODEL_DIR"
@@ -159,7 +212,13 @@ ensure_model() {
 }
 
 build_whisper_server() {
-  local source_archive source_dir build_dir temp_root source_root built_server cuda_arch
+  # Skip rebuild if binary already exists and is executable
+  if [ -x "$WHISPER_SERVER_DEST" ]; then
+    log "whisper-server already built at $WHISPER_SERVER_DEST"
+    confirm "Rebuild whisper-server? [y/N] "
+  fi
+
+  local source_archive temp_root source_root build_dir cuda_arch built_server
 
   mkdir -p "$CACHE_DIR"
   source_archive="$CACHE_DIR/whisper.cpp-$WHISPER_VERSION.tar.gz"
@@ -189,7 +248,7 @@ build_whisper_server() {
   cmake --build "$build_dir" --config Release -j "$BUILD_JOBS"
 
   built_server="$build_dir/bin/whisper-server"
-  [ -x "$built_server" ] || die "whisper-server build failed."
+  [ -x "$built_server" ] || die "whisper-server build failed. Check cmake output above."
 
   mkdir -p "$WHISPER_HOME/bin"
   cp "$built_server" "$WHISPER_SERVER_DEST"
@@ -199,12 +258,16 @@ build_whisper_server() {
 }
 
 setup_python_venv() {
-  log "Setting up Python virtual environment."
+  log "Setting up Python virtual environment..."
   if [ ! -d "$VENV_DIR" ]; then
     "$PYTHON_BIN" -m venv "$VENV_DIR"
   fi
-  "$VENV_DIR/bin/pip" install --quiet --upgrade pip
-  "$VENV_DIR/bin/pip" install --quiet -r "$REPO_ROOT/linux/requirements.txt"
+  # Use public PyPI only and suppress interactive prompts from private indexes
+  "$VENV_DIR/bin/pip" install --quiet --upgrade pip \
+    --index-url https://pypi.org/simple/ --no-input 2>/dev/null
+  "$VENV_DIR/bin/pip" install --quiet \
+    --index-url https://pypi.org/simple/ --no-input \
+    -r "$REPO_ROOT/linux/requirements.txt"
   log "Python venv ready at $VENV_DIR"
 }
 
@@ -249,7 +312,6 @@ EOF
 
 create_desktop_entry() {
   mkdir -p "$(dirname "$DESKTOP_FILE")"
-  # Exec= in .desktop files: quote the path if it contains spaces
   local escaped_launcher
   escaped_launcher="$(printf '%s' "$LAUNCHER_SCRIPT" | sed 's/ /\\ /g')"
   cat > "$DESKTOP_FILE" <<EOF
@@ -283,12 +345,13 @@ EOF
   log "Autostart entry: $AUTOSTART_FILE"
 }
 
+# ─── Doctor ───
+
 doctor() {
   local install_token audio_device
 
   [ -f "$RUNTIME_JSON" ] || die "Missing runtime config at $RUNTIME_JSON"
 
-  # Check runtime paths from JSON
   local runtime_ffmpeg runtime_server runtime_model
   runtime_ffmpeg="$(python3 -c "import json; print(json.load(open('$RUNTIME_JSON')).get('ffmpeg_path',''))" 2>/dev/null || true)"
   runtime_server="$(python3 -c "import json; print(json.load(open('$RUNTIME_JSON')).get('whisper_server_path',''))" 2>/dev/null || true)"
@@ -301,7 +364,9 @@ doctor() {
 
   [ -d "$VENV_DIR" ] || die "Python venv missing at $VENV_DIR"
   "$VENV_DIR/bin/python3" -c "import pynput" 2>/dev/null || die "pynput not installed in venv"
-  "$VENV_DIR/bin/python3" -c "import PyQt6" 2>/dev/null || log "Warning: PyQt6 not installed in venv (overlay will be disabled)"
+  "$VENV_DIR/bin/python3" -c "import PyQt6" 2>/dev/null || warn "PyQt6 not installed in venv (border overlay will be disabled)"
+
+  command -v nvidia-smi >/dev/null 2>&1 || warn "nvidia-smi not found (GPU acceleration may not work)"
 
   install_token="$(python3 -c "import json; print(json.load(open('$RUNTIME_JSON')).get('install_token',''))" 2>/dev/null || true)"
   [ -n "$install_token" ] || die "Missing install_token in $RUNTIME_JSON"
@@ -317,7 +382,7 @@ doctor() {
   cat <<EOF
 Local Voice Scribe (Linux) doctor check passed.
   - install token: $install_token
-  - model checksum matches
+  - model checksum: OK
   - Focusrite Scarlett: $audio_status
   - Python venv: $VENV_DIR
   - whisper-server: $runtime_server
@@ -325,15 +390,16 @@ Local Voice Scribe (Linux) doctor check passed.
 EOF
 }
 
+# ─── Main ───
+
 main() {
-  local auto_yes=0
   local doctor_mode=0
   local install_token audio_device
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --yes)
-        auto_yes=1
+        AUTO_YES=1
         ;;
       --doctor)
         doctor_mode=1
@@ -357,12 +423,13 @@ main() {
     exit 0
   fi
 
-  if [ "$auto_yes" -ne 1 ]; then
+  if [ "$AUTO_YES" -ne 1 ]; then
     log "Repo: $REPO_ROOT"
     confirm "Install or update Local Voice Scribe on this Linux machine? [Y/n] "
   fi
 
-  check_system_packages
+  check_nvidia_driver
+  install_system_packages
   check_python
   ensure_model
   build_whisper_server
@@ -386,31 +453,34 @@ main() {
 
   cat <<EOF
 
-Local Voice Scribe (Linux) is installed.
+===================================
+  Local Voice Scribe is installed!
+===================================
 
-To start:
+Start now:
   $LAUNCHER_SCRIPT
 
 Or launch "Local Voice Scribe" from your application menu.
 It will auto-start on next login.
 
 Configuration:
-  Runtime: $RUNTIME_JSON
-  User config: $CONFIG_DIR/config.json (create to override defaults)
-  Dictionary: $CONFIG_DIR/dictionary.txt
+  Runtime config:  $RUNTIME_JSON
+  User overrides:  $CONFIG_DIR/config.json (create to customize)
+  Dictionary:      $CONFIG_DIR/dictionary.txt
 
 Hotkeys (defaults):
-  Super+Alt+R  - Toggle recording
-  Super+Alt+C  - Open dictionary editor
-  Super+Alt+T  - Open transcript folder
+  Super+Alt+R  Toggle recording
+  Super+Alt+C  Open dictionary editor
+  Super+Alt+T  Open transcript folder
 
-For a non-mutating verification pass:
+Verify install:
   ./scripts/setup-linux.sh --doctor
 EOF
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AUTO_YES=0
 
 WHISPER_VERSION="${WHISPER_VERSION:-v1.8.4}"
 WHISPER_SOURCE_URL="${WHISPER_SOURCE_URL:-https://github.com/ggml-org/whisper.cpp/archive/refs/tags/$WHISPER_VERSION.tar.gz}"

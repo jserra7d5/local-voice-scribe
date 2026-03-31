@@ -3,13 +3,15 @@
 import json
 import subprocess
 
+from pathlib import Path
+
 from . import config as cfg
 from .dictionary import load_dictionary
 
 
-def transcribe(log_fn) -> str | None:
+def transcribe(log_fn, audio_file: Path | None = None) -> str | None:
     """Send the temp audio file to whisper-server for transcription. Returns text or None."""
-    audio_file = cfg.TEMP_AUDIO_FILE
+    audio_file = audio_file or cfg.TEMP_AUDIO_FILE
     if not audio_file.exists():
         log_fn("transcribe: audio file missing")
         return None

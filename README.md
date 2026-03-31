@@ -109,10 +109,11 @@ For a non-mutating verification pass:
 
 ### Linux
 - `Super+Alt+R` toggles recording
-- `Super+Alt+C` opens the dictionary editor
+- `Super+Alt+C` opens the settings window
 - `Super+Alt+T` opens the transcript folder in the file manager
 - Daemon starts `whisper-server` on launch and shuts it down after idle timeout
 - Floating red dot indicator during recording (PyQt6)
+- Settings window exposes ducking, hotkeys, audio input, and dictionary controls
 
 ### Both platforms
 - Successful transcriptions are copied to the clipboard and archived under `/tmp/local-voice-scribe-transcripts`

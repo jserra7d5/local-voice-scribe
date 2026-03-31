@@ -472,7 +472,7 @@ Configuration:
 
 Hotkeys (defaults):
   Super+Alt+R  Toggle recording
-  Super+Alt+C  Open dictionary editor
+  Super+Alt+C  Open settings window
   Super+Alt+T  Open transcript folder
 
 Verify install:

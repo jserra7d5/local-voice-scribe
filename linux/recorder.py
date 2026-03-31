@@ -29,6 +29,33 @@ def detect_focusrite() -> str | None:
     return None
 
 
+def list_input_sources() -> list[dict]:
+    """List user-facing input sources from pactl."""
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "sources", "short"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return []
+
+    sources = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        source_name = parts[1].strip()
+        if not source_name.startswith("alsa_input."):
+            continue
+        label = source_name.replace("alsa_input.", "").replace(".", " ")
+        sources.append({
+            "name": source_name,
+            "label": label,
+            "is_focusrite": "scarlett" in source_name.lower() or "focusrite" in source_name.lower(),
+        })
+    return sources
+
+
 class Recorder:
     """Records audio from a PulseAudio/PipeWire source via ffmpeg."""
 

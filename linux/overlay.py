@@ -1,42 +1,47 @@
-"""PyQt6 screen border overlay and dictionary editor."""
+"""PyQt6 screen border overlay and settings window."""
+
+from __future__ import annotations
 
 import sys
+import threading
 
-from PyQt6.QtCore import Qt, QTimer, QRect, pyqtSignal, QObject
-from PyQt6.QtGui import QColor, QPainter, QBrush, QCursor, QFont, QRegion
-from PyQt6.QtWidgets import (
-    QApplication, QWidget, QDialog, QVBoxLayout, QHBoxLayout,
-    QTextEdit, QPushButton, QLabel,
-)
+from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QCursor, QPainter, QRegion
+from PyQt6.QtWidgets import QApplication, QWidget
 
 from . import config as cfg
+from .settings import SettingsWindow
 
 BORDER_THICKNESS = 6
 
-BORDER_COLORS = {
-    "recording": QColor(255, 40, 40),
-    "transcribing": QColor(255, 200, 0),
-    "complete": QColor(40, 220, 40),
-}
+def _build_border_colors(config: dict) -> dict[str, QColor]:
+    return {
+        "recording": QColor(config.get("border_color_recording", cfg.DEFAULTS["border_color_recording"])),
+        "transcribing": QColor(config.get("border_color_transcribing", cfg.DEFAULTS["border_color_transcribing"])),
+        "complete": QColor(config.get("border_color_complete", cfg.DEFAULTS["border_color_complete"])),
+    }
 
 
 class StateSignal(QObject):
-    """Thread-safe signal for state updates from daemon to overlay."""
+    """Thread-safe signals for daemon-to-Qt updates."""
+
     state_changed = pyqtSignal(str)
-    show_editor = pyqtSignal()
+    show_settings = pyqtSignal()
     quit_signal = pyqtSignal()
+    clipboard_copy = pyqtSignal(str, object)
 
 
 class BorderOverlay(QWidget):
-    """Full-screen border effect on the active monitor, matching Hammerspoon's hs.canvas borders."""
+    """Full-screen border effect on the active monitor."""
 
-    def __init__(self):
+    def __init__(self, config: dict):
         super().__init__()
         self._state = "idle"
         self._alpha = 230
         self._color = QColor(0, 0, 0, 0)
         self._fade_step = 0
-        self._fade_gen = 0
+        self._enabled = True
+        self._colors = _build_border_colors(config)
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -48,30 +53,37 @@ class BorderOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
-        # Fade-out timer for flash effects
         self._fade_timer = QTimer(self)
         self._fade_timer.timeout.connect(self._fade_tick)
 
-        # Auto-hide timer for complete state
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
-        self._hide_timer.timeout.connect(self._on_complete_done)
+        self._hide_timer.timeout.connect(self._clear)
+        self.update_config(config)
+
+    def update_config(self, config: dict):
+        self._enabled = bool(config.get("border_flash_enabled", True))
+        self._colors = _build_border_colors(config)
+        if not self._enabled:
+            self._clear()
 
     def set_state(self, state: str):
         self._state = state
         self._fade_timer.stop()
+        if not self._enabled:
+            self._clear()
+            return
 
         if state == "recording":
-            self._show_border(BORDER_COLORS["recording"], persistent=True)
+            self._show_border(self._colors["recording"], persistent=True)
         elif state == "transcribing":
-            self._show_border(BORDER_COLORS["transcribing"], persistent=False)
+            self._show_border(self._colors["transcribing"], persistent=False)
         elif state == "complete":
-            self._show_border(BORDER_COLORS["complete"], persistent=False)
+            self._show_border(self._colors["complete"], persistent=False)
         else:
             self._clear()
 
     def _show_border(self, color: QColor, persistent: bool):
-        """Position on active screen, set up the border mask, and show."""
         self._hide_timer.stop()
         self._fade_timer.stop()
 
@@ -82,7 +94,6 @@ class BorderOverlay(QWidget):
         geo = screen.geometry()
         self.setGeometry(geo)
 
-        # Build a mask that is only the border strips (hollow rectangle)
         t = BORDER_THICKNESS
         outer = QRegion(0, 0, geo.width(), geo.height())
         inner = QRegion(t, t, geo.width() - 2 * t, geo.height() - 2 * t)
@@ -95,8 +106,6 @@ class BorderOverlay(QWidget):
         self.show()
 
         if not persistent:
-            # Fade out over ~550ms
-            self._fade_gen += 1
             self._fade_step = 0
             self._fade_timer.start(50)
 
@@ -114,9 +123,6 @@ class BorderOverlay(QWidget):
         self._color.setAlpha(max(0, self._alpha))
         self.update()
 
-    def _on_complete_done(self):
-        self._clear()
-
     def _clear(self):
         self._fade_timer.stop()
         self._hide_timer.stop()
@@ -129,92 +135,8 @@ class BorderOverlay(QWidget):
         painter.end()
 
 
-class DictionaryEditor(QDialog):
-    """Floating dictionary editor dialog with dark theme."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Whisper Dictionary")
-        self.setMinimumSize(400, 300)
-        self.resize(450, 350)
-        self.setWindowFlags(
-            Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Dialog
-        )
-
-        self._setup_ui()
-        self._apply_style()
-
-    def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-
-        header = QLabel("One word per line, or: wrong -> right")
-        header.setStyleSheet("color: #888; font-size: 13px;")
-        layout.addWidget(header)
-
-        self.text_edit = QTextEdit()
-        self.text_edit.setFont(QFont("Monospace", 12))
-        layout.addWidget(self.text_edit)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
-
-        save_btn = QPushButton("Save")
-        save_btn.setObjectName("saveBtn")
-        save_btn.clicked.connect(self._save)
-        btn_layout.addWidget(save_btn)
-
-        layout.addLayout(btn_layout)
-
-    def _apply_style(self):
-        self.setStyleSheet("""
-            QDialog { background: #1e1e1e; }
-            QTextEdit {
-                background: #2d2d2d; color: #d4d4d4;
-                border: 1px solid #444; border-radius: 4px;
-                padding: 8px; selection-background-color: #264f78;
-            }
-            QTextEdit:focus { border-color: #666; }
-            QPushButton {
-                padding: 6px 16px; border: none; border-radius: 4px;
-                font-size: 13px; background: #444; color: #ccc;
-            }
-            QPushButton:hover { background: #555; }
-            QPushButton#saveBtn { background: #2ea043; color: white; }
-            QPushButton#saveBtn:hover { background: #3fb950; }
-        """)
-
-    def open_editor(self):
-        """Load dictionary content and show the dialog."""
-        content = ""
-        if cfg.DICTIONARY_FILE.exists():
-            content = cfg.DICTIONARY_FILE.read_text()
-        self.text_edit.setPlainText(content)
-        self.show()
-        self.raise_()
-        self.activateWindow()
-        self.text_edit.setFocus()
-
-    def _save(self):
-        content = self.text_edit.toPlainText()
-        try:
-            cfg.DICTIONARY_FILE.write_text(content)
-            count = sum(1 for line in content.splitlines() if line.strip())
-            from .notifications import notify
-            notify(f"Dictionary saved ({count} entries)")
-        except OSError as e:
-            from .notifications import notify
-            notify(f"Save failed: {e}", title="Error")
-        self.accept()
-
-
 class OverlayApp:
-    """Manages the Qt application, border overlay, and dictionary editor."""
+    """Manages the Qt application, border overlay, settings window, and clipboard bridge."""
 
     def __init__(self, daemon):
         self._daemon = daemon
@@ -222,25 +144,46 @@ class OverlayApp:
         self._app.setQuitOnLastWindowClosed(False)
 
         self._signals = StateSignal()
-        self._border = BorderOverlay()
-        self._editor = DictionaryEditor()
+        self._border = BorderOverlay(daemon.config)
+        self._settings = SettingsWindow(daemon)
 
-        self._signals.state_changed.connect(self._border.set_state)
-        self._signals.show_editor.connect(self._editor.open_editor)
+        self._signals.state_changed.connect(self._on_state_changed)
+        self._signals.show_settings.connect(self._settings.open_window)
         self._signals.quit_signal.connect(self._app.quit)
+        self._signals.clipboard_copy.connect(self._copy_to_clipboard)
+
+    def _on_state_changed(self, state: str):
+        self._border.set_state(state)
+        self._settings.set_state(state)
+
+    def _copy_to_clipboard(self, text: str, response: object):
+        clipboard = self._app.clipboard()
+        clipboard.setText(text)
+        self._app.processEvents()
+        ok = clipboard.text() == text
+        if isinstance(response, dict):
+            response["ok"] = ok
+            event = response.get("event")
+            if isinstance(event, threading.Event):
+                event.set()
 
     def set_state(self, state: str):
-        """Thread-safe state update (called from daemon thread)."""
         self._signals.state_changed.emit(state)
 
-    def show_dictionary_editor(self):
-        """Thread-safe editor open (called from daemon thread)."""
-        self._signals.show_editor.emit()
+    def update_config(self, config: dict):
+        self._border.update_config(config)
+
+    def show_settings_window(self):
+        self._signals.show_settings.emit()
+
+    def copy_to_clipboard(self, text: str, timeout_s: float = 1.0) -> bool:
+        response = {"ok": False, "event": threading.Event()}
+        self._signals.clipboard_copy.emit(text, response)
+        response["event"].wait(timeout_s)
+        return bool(response["ok"])
 
     def quit(self):
-        """Thread-safe quit (called from signal handler)."""
         self._signals.quit_signal.emit()
 
     def run(self):
-        """Run the Qt event loop (blocks)."""
         self._app.exec()

@@ -251,8 +251,12 @@ build_whisper_server() {
   built_server="$build_dir/bin/whisper-server"
   [ -x "$built_server" ] || die "whisper-server build failed. Check cmake output above."
 
-  mkdir -p "$WHISPER_HOME/bin"
+  mkdir -p "$WHISPER_HOME/bin" "$WHISPER_HOME/lib"
   cp "$built_server" "$WHISPER_SERVER_DEST"
+  # Copy shared libraries that whisper-server depends on (whisper + all ggml variants)
+  find "$build_dir" -name 'libwhisper.so*' -o -name 'libggml*.so*' | while read -r lib; do
+    cp -a "$lib" "$WHISPER_HOME/lib/"
+  done
   log "whisper-server installed to $WHISPER_SERVER_DEST"
 
   rm -rf "$temp_root"

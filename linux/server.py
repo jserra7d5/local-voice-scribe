@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import urllib.request
+from pathlib import Path
 
 from . import config as cfg
 from .notifications import notify
@@ -69,11 +70,17 @@ class WhisperServer:
         self.log(f"server cmd: {' '.join(cmd)}")
 
         try:
+            # Ensure whisper-server can find its shared libraries
+            env = os.environ.copy()
+            lib_dir = str(Path(server_path).parent.parent / "lib")
+            env["LD_LIBRARY_PATH"] = lib_dir + ":" + env.get("LD_LIBRARY_PATH", "")
+
             with self._lock:
                 self._process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    env=env,
                 )
             self._write_pid(self._process.pid)
             self.log(f"server started pid={self._process.pid}")

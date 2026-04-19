@@ -276,8 +276,22 @@ build_whisper_server() {
   built_server="$build_dir/bin/whisper-server"
   [ -x "$built_server" ] || die "whisper-server build failed."
 
-  mkdir -p "$WHISPER_HOME/bin"
-  cp "$built_server" "$WHISPER_SERVER_DEST"
+  rm -rf "$WHISPER_HOME/bin" "$WHISPER_HOME/lib"
+  "$CMAKE_BIN" --install "$build_dir" --prefix "$WHISPER_HOME"
+  [ -x "$WHISPER_SERVER_DEST" ] || die "Installed whisper-server missing at $WHISPER_SERVER_DEST"
+
+  if command -v install_name_tool >/dev/null 2>&1; then
+    local binary dylib
+    for binary in "$WHISPER_HOME"/bin/*; do
+      [ -f "$binary" ] || continue
+      install_name_tool -add_rpath "@executable_path/../lib" "$binary" 2>/dev/null || true
+    done
+    for dylib in "$WHISPER_HOME"/lib/*.dylib; do
+      [ -e "$dylib" ] || continue
+      install_name_tool -add_rpath "@loader_path" "$dylib" 2>/dev/null || true
+    done
+  fi
+
   if [ -d "$source_root/examples/server/public" ]; then
     rm -rf "$WHISPER_PUBLIC_DIR"
     mkdir -p "$WHISPER_PUBLIC_DIR"

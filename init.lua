@@ -106,6 +106,10 @@ local function firstExistingPath(candidates)
     return nil
 end
 
+local function parentDir(path)
+    return path and path:match("^(.*)/[^/]+$") or nil
+end
+
 local function ensureDirectory(path)
     if pathExists(path) then return true end
     local ok, err = pcall(hs.fs.mkdir, path)
@@ -174,6 +178,14 @@ local whisperPublicPath = config.whisper_public_path
         configDir .. "/whisper/public",
         legacyWhisperRoot .. "/examples/server/public",
     })
+local whisperLibPath = firstExistingPath({
+    (function()
+        local serverDir = parentDir(whisperServerPath)
+        local rootDir = parentDir(serverDir)
+        return rootDir and (rootDir .. "/lib") or nil
+    end)(),
+    configDir .. "/whisper/lib",
+})
 local modelPath = config.model_path
     or firstExistingPath({
         configDir .. "/models/ggml-large-v3-turbo.bin",
@@ -429,10 +441,15 @@ local function launchServerIfNeeded()
     log("launching new server")
     hs.execute("lsof -ti:" .. whisperServerPort .. " | xargs kill -9 2>/dev/null", true)
 
-    local envPrefix = ""
+    local envParts = {}
     if pathExists(ggmlMetalPathResources) then
-        envPrefix = "GGML_METAL_PATH_RESOURCES=" .. shellQuote(ggmlMetalPathResources) .. " "
+        table.insert(envParts, "GGML_METAL_PATH_RESOURCES=" .. shellQuote(ggmlMetalPathResources))
     end
+    if pathExists(whisperLibPath) then
+        table.insert(envParts, "DYLD_LIBRARY_PATH=" .. shellQuote(whisperLibPath))
+        table.insert(envParts, "DYLD_FALLBACK_LIBRARY_PATH=" .. shellQuote(whisperLibPath))
+    end
+    local envPrefix = (#envParts > 0) and (table.concat(envParts, " ") .. " ") or ""
     whisperServerTask = hs.task.new("/bin/sh", function(exitCode)
         log("whisper-server exited: " .. tostring(exitCode))
         whisperServerTask = nil
@@ -443,7 +460,7 @@ local function launchServerIfNeeded()
             .. " -l en --port " .. tostring(whisperServerPort)
             .. " --host 127.0.0.1"
             .. (whisperPublicPath and (" --public " .. shellQuote(whisperPublicPath)) or "")
-            .. " >/dev/null 2>&1"
+            .. " >>" .. shellQuote(logFile) .. " 2>&1"
     })
     whisperServerTask:start()
     log("server task started")

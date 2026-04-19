@@ -135,10 +135,92 @@ EOF
     bash -c "source '$ROOT/scripts/setup.sh'; doctor" >/dev/null
 }
 
+case_build_installs_runtime_libs() {
+  local sandbox home_dir runtime_dir cache_dir mockbin source_root archive_path archive_sha cmake_log install_name_log
+  sandbox="$(mktemp -d)"
+  home_dir="$sandbox/home"
+  runtime_dir="$home_dir/.local-voice-scribe"
+  cache_dir="$runtime_dir/cache"
+  mockbin="$sandbox/mockbin"
+  source_root="$sandbox/src/whisper.cpp-test"
+  archive_path="$cache_dir/whisper.cpp-test.tar.gz"
+  cmake_log="$sandbox/cmake.log"
+  install_name_log="$sandbox/install_name_tool.log"
+
+  mkdir -p "$home_dir" "$cache_dir" "$mockbin" "$source_root/examples/server/public"
+  printf 'public asset\n' > "$source_root/examples/server/public/index.html"
+  tar -czf "$archive_path" -C "$sandbox/src" whisper.cpp-test
+  archive_sha="$(portable_sha256 "$archive_path")"
+
+  cat > "$mockbin/cmake" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+log_file="${MOCK_CMAKE_LOG:?}"
+printf '%s\n' "$*" >> "$log_file"
+
+if [ "$1" = "-S" ]; then
+  build_dir=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-B" ]; then
+      build_dir="$2"
+      break
+    fi
+    shift
+  done
+  mkdir -p "$build_dir/bin"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$build_dir/bin/whisper-server"
+  chmod +x "$build_dir/bin/whisper-server"
+  exit 0
+fi
+
+if [ "$1" = "--build" ]; then
+  exit 0
+fi
+
+if [ "$1" = "--install" ]; then
+  build_dir="$2"
+  prefix=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--prefix" ]; then
+      prefix="$2"
+      break
+    fi
+    shift
+  done
+  mkdir -p "$prefix/bin" "$prefix/lib"
+  cp "$build_dir/bin/whisper-server" "$prefix/bin/whisper-server"
+  : > "$prefix/lib/libwhisper.1.dylib"
+  exit 0
+fi
+
+exit 1
+EOF
+  chmod +x "$mockbin/cmake"
+
+  cat > "$mockbin/install_name_tool" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${MOCK_INSTALL_NAME_LOG:?}"
+exit 0
+EOF
+  chmod +x "$mockbin/install_name_tool"
+
+  LVS_ALLOW_NON_DARWIN=1 HOME="$home_dir" LVS_CONFIG_DIR="$runtime_dir" MOCK_CMAKE_LOG="$cmake_log" MOCK_INSTALL_NAME_LOG="$install_name_log" PATH="$mockbin:$PATH" \
+    WHISPER_VERSION="test" WHISPER_SOURCE_SHA256="$archive_sha" CMAKE_BIN="$mockbin/cmake" BUILD_JOBS=1 \
+    bash -c "source '$ROOT/scripts/setup.sh'; build_whisper_server" >/dev/null
+
+  grep -F -- '--install' "$cmake_log" >/dev/null
+  grep -F -- '@executable_path/../lib' "$install_name_log" >/dev/null
+  [ -x "$runtime_dir/whisper/bin/whisper-server" ]
+  [ -f "$runtime_dir/whisper/lib/libwhisper.1.dylib" ]
+  [ -f "$runtime_dir/whisper/public/index.html" ]
+}
+
 run_expect_failure "unmanaged-init-aborts" case_unmanaged_init_aborts
 run_expect_success "managed-block-updates" case_managed_block_updates
 run_expect_success "runtime-file-contains-token" case_runtime_file_contains_token
 run_expect_success "doctor-succeeds-with-matching-token" case_doctor_succeeds_with_matching_token
+run_expect_success "build-installs-runtime-libs" case_build_installs_runtime_libs
 
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]

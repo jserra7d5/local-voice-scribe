@@ -20,6 +20,7 @@ local defaults = {
     hotkey_toggle_recording = { mods = {"cmd", "alt"}, key = "R" },
     hotkey_dictionary_editor = { mods = {"cmd", "alt"}, key = "C" },
     hotkey_open_transcripts = { mods = {"cmd", "alt"}, key = "T" },
+    hotkey_toggle_ducking = { mods = {"cmd", "alt"}, key = "Z" },
     ffmpeg_path = nil,
     whisper_server_path = nil,
     whisper_public_path = nil,
@@ -44,6 +45,7 @@ local runtimeOwnedKeys = {
 }
 
 local log
+local ffmpegPath
 
 local function mergeConfig(candidate, source)
     if type(candidate) ~= "table" then return end
@@ -126,23 +128,135 @@ local function configuredAudioDeviceQuery()
     return query
 end
 
+local function configuredAudioDeviceMatches(device, query)
+    if not device or not query then return false end
+
+    local uid = device:uid()
+    if uid and uid == query then
+        return true
+    end
+
+    local name = device:name()
+    if name == query then
+        return true
+    end
+
+    local queryLower = query:lower()
+    return name and name:lower():find(queryLower, 1, true) ~= nil
+end
+
 local function resolveConfiguredAudioInputDevice()
     local query = configuredAudioDeviceQuery()
     if not query then return nil end
 
-    local queryLower = query:lower()
     local partialMatch = nil
     for _, device in ipairs(hs.audiodevice.allInputDevices() or {}) do
-        local name = device:name()
-        if name == query then
-            return device
-        end
-        if not partialMatch and name and name:lower():find(queryLower, 1, true) then
-            partialMatch = device
+        if configuredAudioDeviceMatches(device, query) then
+            local uid = device:uid()
+            if uid == query or device:name() == query then
+                return device
+            end
+            if not partialMatch then
+                partialMatch = device
+            end
         end
     end
 
     return partialMatch
+end
+
+local function listAvfoundationAudioInputs()
+    if not ffmpegPath or not pathExists(ffmpegPath) then
+        return nil, "ffmpeg not found"
+    end
+
+    local probe = shellQuote(ffmpegPath) .. " -hide_banner -f avfoundation -list_devices true -i '' 2>&1"
+    local output = hs.execute("/bin/sh -c " .. shellQuote(probe), true) or ""
+    local inputs = {}
+    local inAudioSection = false
+
+    for rawLine in output:gmatch("[^\r\n]+") do
+        local line = trim(rawLine) or ""
+        if line:find("AVFoundation audio devices:", 1, true) then
+            inAudioSection = true
+        elseif line:find("AVFoundation video devices:", 1, true) then
+            inAudioSection = false
+        elseif inAudioSection then
+            local index, name = line:match("%[(%d+)%]%s+(.+)$")
+            if index and name then
+                table.insert(inputs, {
+                    index = index,
+                    name = trim(name),
+                })
+            end
+        end
+    end
+
+    if #inputs == 0 then
+        return nil, "No AVFoundation audio devices reported by ffmpeg"
+    end
+
+    return inputs
+end
+
+local function avfoundationAudioInputSpecifier(device)
+    if not device then
+        lastResolvedAudioDeviceName = nil
+        return "default"
+    end
+
+    local deviceName = trim(device:name())
+    local inputs, err = listAvfoundationAudioInputs()
+    if not inputs then
+        return nil, err
+    end
+
+    for _, input in ipairs(inputs) do
+        if input.name == deviceName then
+            lastResolvedAudioDeviceName = device:name()
+            return input.index
+        end
+    end
+
+    return nil, "Audio input device not available to ffmpeg: " .. tostring(device:name())
+end
+
+local function selectedAudioDeviceValue(device)
+    if not device then return nil end
+    return device:uid() or device:name()
+end
+
+local function configuredAudioDeviceIsSelected(device)
+    local query = configuredAudioDeviceQuery()
+    if not query then return false end
+    return configuredAudioDeviceMatches(device, query)
+end
+
+local function configuredAudioDeviceDisplayName()
+    local device = resolveConfiguredAudioInputDevice()
+    if device then
+        return device:name()
+    end
+
+    return configuredAudioDeviceQuery()
+end
+
+local function recordingAudioInputSpecifier()
+    local device = resolveConfiguredAudioInputDevice()
+    if configuredAudioDeviceQuery() and not device then
+        return nil, "Audio input device not found: " .. tostring(configuredAudioDeviceDisplayName())
+    end
+
+    local specifier, err = avfoundationAudioInputSpecifier(device)
+    if not specifier then
+        return nil, err
+    end
+
+    if device then
+        lastResolvedAudioDeviceName = device:name()
+    end
+
+    return specifier
 end
 
 local function transcriptFilename(startedAt, durationSeconds)
@@ -189,7 +303,7 @@ end
 
 local recordingTask = nil
 local tempAudioFile = "/tmp/whisper_recording.wav"
-local ffmpegPath = config.ffmpeg_path
+ffmpegPath = config.ffmpeg_path
     or firstExistingPath({
         "/opt/homebrew/bin/ffmpeg",
         "/usr/local/bin/ffmpeg",
@@ -247,26 +361,10 @@ do
     if file then file:write("=== Hammerspoon reload " .. os.date() .. " ===\n"); file:close() end
 end
 
-local function recordingAudioInputSpecifier()
-    local query = configuredAudioDeviceQuery()
-    if not query then
-        lastResolvedAudioDeviceName = nil
-        return "default"
-    end
-
-    local device = resolveConfiguredAudioInputDevice()
-    if not device then
-        return nil, "Audio input device not found: " .. query
-    end
-
-    lastResolvedAudioDeviceName = device:name()
-    return lastResolvedAudioDeviceName
-end
-
 local function pinConfiguredSystemInputDevice(showAlertOnFailure)
     if not config.pin_system_input_device then return true end
 
-    local query = configuredAudioDeviceQuery()
+    local query = configuredAudioDeviceDisplayName()
     if not query then return true end
 
     local device = resolveConfiguredAudioInputDevice()
@@ -333,6 +431,36 @@ local function ensureFfmpegDependency()
 end
 
 hs.alert.defaultStyle.atScreenEdge = 1
+
+local alertVerticalOffset = 35
+local originalAlertShow = hs.alert.show
+
+local function offsetAlertByUuid(uuid, yOffset)
+    if not uuid or not yOffset or yOffset == 0 then return uuid end
+
+    for _, alertEntry in ipairs(hs.alert._visibleAlerts or {}) do
+        if alertEntry.UUID == uuid then
+            for _, drawing in ipairs(alertEntry.drawings or {}) do
+                local frame = drawing:frame()
+                if frame then
+                    drawing:setTopLeft({ x = frame.x, y = frame.y + yOffset })
+                end
+            end
+            if alertEntry.frame then
+                alertEntry.frame.y = alertEntry.frame.y + yOffset
+            end
+            break
+        end
+    end
+
+    return uuid
+end
+
+hs.alert.show = function(...)
+    hs.alert.closeAll(0)
+    local uuid = originalAlertShow(...)
+    return offsetAlertByUuid(uuid, alertVerticalOffset)
+end
 
 -- Border visual effects
 local borderCanvas = nil
@@ -436,6 +564,8 @@ local function restoreDuckState()
 end
 
 local duckRampTimers = {}
+local manualDuckEnabled = false
+local reconcileDucking
 
 local function rampVolume(appName, fromVol, toVol, duration, onComplete)
     if duckRampTimers[appName] then duckRampTimers[appName]:stop(); duckRampTimers[appName] = nil end
@@ -485,6 +615,31 @@ local function unduckAudio()
         end
     end
     if appsToRamp == 0 then clearDuckState() end
+end
+
+reconcileDucking = function()
+    if config.duck_enabled and (currentState == "recording" or manualDuckEnabled) then
+        duckAudio()
+    else
+        unduckAudio()
+    end
+end
+
+local function toggleManualDucking()
+    if not config.duck_enabled then
+        hs.alert.show("Ducking is disabled", 2)
+        return
+    end
+
+    manualDuckEnabled = not manualDuckEnabled
+    reconcileDucking()
+    log("manual ducking toggled: " .. tostring(manualDuckEnabled))
+
+    if manualDuckEnabled then
+        hs.alert.show("Audio set to " .. tostring(config.duck_level) .. "%", 2)
+    else
+        hs.alert.show("Audio set to 100%", 2)
+    end
 end
 
 restoreDuckState()
@@ -650,6 +805,7 @@ local function finishTranscription(message)
     if hs.fs.attributes(tempAudioFile) then os.remove(tempAudioFile) end
     clearBorder()
     updateState("idle")
+    reconcileDucking()
     resetServerIdleTimer()
     transcriptionStartedFor = nil
     recordingStartedAt = nil
@@ -684,6 +840,7 @@ local function startRecording()
     lastRecordingDurationSeconds = nil
     local gen = sessionId
     updateState("recording")
+    reconcileDucking()
     log("startRecording session=" .. gen)
     log("recording audio input=" .. tostring(lastResolvedAudioDeviceName or audioInputSpecifier))
     recordingStartedAt = hs.timer.secondsSinceEpoch()
@@ -700,7 +857,6 @@ local function startRecording()
 
     if hs.fs.attributes(tempAudioFile) then os.remove(tempAudioFile) end
 
-    duckAudio()
     showBorder("recording")
     hs.alert.show("Recording started")
 
@@ -711,7 +867,6 @@ local function startRecording()
         -- If we're still in recording state, ffmpeg crashed unexpectedly
         if currentState == "recording" then
             log("ffmpeg crashed unexpectedly during recording")
-            unduckAudio()
             finishTranscription("Recording failed (ffmpeg crashed)")
             return
         end
@@ -729,7 +884,6 @@ local function startRecording()
 
     if not recordingTask then
         log("ERROR: failed to create ffmpeg task")
-        unduckAudio()
         finishTranscription("Recording failed (could not start ffmpeg)")
         return
     end
@@ -818,6 +972,7 @@ function doTranscription(gen)
             local preview = transcription
             if #preview > 60 then preview = preview:sub(1, 60) end
             updateState("complete")
+            reconcileDucking()
             flashBorder("complete")
             hs.alert.show("Copied to clipboard\n\n" .. preview, 5)
             recordingStartedAt = nil
@@ -825,6 +980,7 @@ function doTranscription(gen)
             idleResetTimer = hs.timer.doAfter(3, function()
                 if gen ~= sessionId then return end
                 updateState("idle")
+                reconcileDucking()
             end)
         else
             finishTranscription("No transcription found")
@@ -849,9 +1005,9 @@ local function stopRecording()
     end
 
     -- Update state BEFORE sending SIGINT so ffmpeg callback knows this is intentional
-    unduckAudio()
     flashBorder("transcribing")
     updateState("transcribing")
+    reconcileDucking()
     hs.alert.show("Recording stopped. Transcribing")
 
     if recordingTask then
@@ -891,6 +1047,7 @@ end
 -- Dictionary editor webview
 local dictWebview = nil
 local persistAudioDeviceSelection
+local persistSettings
 
 local function closeDictEditor()
     if dictWebview then dictWebview:delete(); dictWebview = nil end
@@ -911,7 +1068,7 @@ hs.urlevent.bind("dict-save", function(eventName, params)
         hs.alert.show("Could not write dictionary", 5)
         return
     end
-    local ok, err = persistAudioDeviceSelection(params.audio_device)
+    local ok, err = persistSettings(params)
     if not ok then
         hs.alert.show(err, 5)
         return
@@ -948,14 +1105,53 @@ local function luaStringLiteral(value)
     return string.format("%q", tostring(value))
 end
 
-persistAudioDeviceSelection = function(selection)
-    local normalized = trim(selection)
-    if normalized == "" then normalized = nil end
+local function serializeLuaValue(value)
+    if value == nil then return "nil" end
+
+    local valueType = type(value)
+    if valueType == "string" then
+        return luaStringLiteral(value)
+    end
+    if valueType == "number" or valueType == "boolean" then
+        return tostring(value)
+    end
+
+    error("Unsupported config value type: " .. valueType)
+end
+
+local function normalizedDuckLevel(selection)
+    local value = tonumber(trim(selection or ""))
+    if not value then
+        return nil, "Ducking level must be a number between 0 and 100"
+    end
+
+    value = math.floor(value + 0.5)
+    if value < 0 then value = 0 end
+    if value > 100 then value = 100 end
+    return value
+end
+
+local function persistConfigValues(updates)
+    local normalized = {}
+    local requestedKeys = {}
+    for key, value in pairs(updates or {}) do
+        normalized[key] = value
+        requestedKeys[key] = true
+    end
 
     local existing = readFileRaw(configFile)
     if not existing or existing == "" then
-        if not normalized then
-            config.audio_device = nil
+        local hasValues = false
+        for _, value in pairs(normalized) do
+            if value ~= nil then
+                hasValues = true
+                break
+            end
+        end
+        if not hasValues then
+            for key, value in pairs(normalized) do
+                config[key] = value
+            end
             lastResolvedAudioDeviceName = nil
             return true
         end
@@ -964,37 +1160,57 @@ persistAudioDeviceSelection = function(selection)
         if not file then
             return false, "Could not open config.lua for writing: " .. tostring(err)
         end
-        file:write("return {\n    audio_device = " .. luaStringLiteral(normalized) .. ",\n}\n")
+        file:write("return {\n")
+        local keysToWrite = {}
+        for key in pairs(requestedKeys) do
+            table.insert(keysToWrite, key)
+        end
+        table.sort(keysToWrite)
+        for _, key in ipairs(keysToWrite) do
+            file:write("    " .. key .. " = " .. serializeLuaValue(normalized[key]) .. ",\n")
+        end
+        file:write("}\n")
         file:close()
-        config.audio_device = normalized
+        for key, value in pairs(normalized) do
+            config[key] = value
+        end
         lastResolvedAudioDeviceName = nil
         return true
     end
 
-    local replacement = "    audio_device = " .. (normalized and luaStringLiteral(normalized) or "nil") .. ","
     local lines = {}
     for line in (existing .. "\n"):gmatch("([^\n]*)\n") do
         table.insert(lines, line)
     end
 
-    local replaced = false
+    local replaced = {}
     local closingIndex = nil
     for i, line in ipairs(lines) do
-        if line:match("^%s*audio_device%s*=") then
+        local key = line:match("^%s*([%a_][%w_]*)%s*=")
+        if key and requestedKeys[key] then
             local indent = line:match("^(%s*)") or "    "
-            lines[i] = indent .. "audio_device = " .. (normalized and luaStringLiteral(normalized) or "nil") .. ","
-            replaced = true
+            lines[i] = indent .. key .. " = " .. serializeLuaValue(normalized[key]) .. ","
+            replaced[key] = true
         end
         if line:match("^%s*}%s*$") then
             closingIndex = i
         end
     end
 
-    if not replaced then
-        if not closingIndex then
-            return false, "Could not update config.lua automatically"
+    if not closingIndex then
+        return false, "Could not update config.lua automatically"
+    end
+
+    local keysToInsert = {}
+    for key in pairs(requestedKeys) do
+        if not replaced[key] then
+            table.insert(keysToInsert, key)
         end
-        table.insert(lines, closingIndex, replacement)
+    end
+    table.sort(keysToInsert)
+    for _, key in ipairs(keysToInsert) do
+        table.insert(lines, closingIndex, "    " .. key .. " = " .. serializeLuaValue(normalized[key]) .. ",")
+        closingIndex = closingIndex + 1
     end
 
     local file, err = io.open(configFile, "w")
@@ -1004,9 +1220,34 @@ persistAudioDeviceSelection = function(selection)
     file:write(table.concat(lines, "\n"))
     file:close()
 
-    config.audio_device = normalized
+    for key, value in pairs(normalized) do
+        config[key] = value
+    end
     lastResolvedAudioDeviceName = nil
     return true
+end
+
+persistAudioDeviceSelection = function(selection)
+    local normalized = trim(selection)
+    if normalized == "" then normalized = nil end
+    return persistConfigValues({
+        audio_device = normalized,
+    })
+end
+
+persistSettings = function(params)
+    local normalizedAudioDevice = trim(params.audio_device)
+    if normalizedAudioDevice == "" then normalizedAudioDevice = nil end
+
+    local duckLevel, duckErr = normalizedDuckLevel(params.duck_level)
+    if not duckLevel then
+        return false, duckErr
+    end
+
+    return persistConfigValues({
+        audio_device = normalizedAudioDevice,
+        duck_level = duckLevel,
+    })
 end
 
 local function audioDeviceOptionsJson()
@@ -1020,15 +1261,16 @@ local function audioDeviceOptionsJson()
     for _, device in ipairs(hs.audiodevice.allInputDevices() or {}) do
         local name = device:name()
         if name then
+            local value = selectedAudioDeviceValue(device) or name
             local detail = {}
             if currentDefault and currentDefault:uid() == device:uid() then
                 table.insert(detail, "Current macOS default")
             end
-            if config.audio_device == name then
+            if configuredAudioDeviceIsSelected(device) then
                 table.insert(detail, "Current Voice Scribe override")
             end
             table.insert(options, {
-                name = name,
+                name = value,
                 label = name,
                 detail = table.concat(detail, " | "),
             })
@@ -1047,11 +1289,11 @@ local function toggleDictionaryEditor()
     end
 
     local screen = hs.screen.mainScreen():frame()
-    local w, h = 760, 420
+    local w, h = 860, 460
     local rect = hs.geometry.rect(screen.x + (screen.w - w) / 2, screen.y + (screen.h - h) / 2, w, h)
 
     local content = readDictionaryRaw():gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"):gsub("'", "&#39;")
-    local selectedAudioDevice = config.audio_device or ""
+    local selectedAudioDevice = selectedAudioDeviceValue(resolveConfiguredAudioInputDevice()) or config.audio_device or ""
     local escapedSelectedAudioDevice = selectedAudioDevice:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"):gsub("'", "&#39;")
     local deviceOptionsJson = audioDeviceOptionsJson()
 
@@ -1092,9 +1334,20 @@ local function toggleDictionaryEditor()
         border-radius: 6px; padding: 8px; font-size: 13px; outline: none;
     }
     select:focus { border-color: #666; }
+    input[type="number"] {
+        width: 100%; background: #2d2d2d; color: #d4d4d4; border: 1px solid #444;
+        border-radius: 6px; padding: 8px; font-size: 13px; outline: none;
+    }
+    input[type="number"]:focus { border-color: #666; }
     .device-note {
         min-height: 38px; background: #1f1f1f; border-radius: 6px; padding: 8px;
         color: #a9b1ba; font-size: 12px; line-height: 1.4;
+    }
+    .field-group {
+        display: flex; flex-direction: column; gap: 6px;
+    }
+    .field-label {
+        color: #c9d1d9; font-size: 12px; font-weight: 600;
     }
     .buttons { display: flex; gap: 8px; justify-content: flex-end; }
     button {
@@ -1121,6 +1374,16 @@ local function toggleDictionaryEditor()
         <select id="audio-device"></select>
         <div id="device-note" class="device-note"></div>
         <div class="subtle">This sets the app's recording input. It does not need to follow the active Bluetooth device.</div>
+        <div style="height: 6px;"></div>
+        <div>
+            <h3>Ducking</h3>
+            <div class="subtle">Set how low Music and Spotify should drop while recording.</div>
+        </div>
+        <div class="field-group">
+            <label class="field-label" for="duck-level">Playback Level While Recording (%)</label>
+            <input id="duck-level" type="number" min="0" max="100" step="1" value="]] .. tostring(config.duck_level or defaults.duck_level) .. [[" />
+        </div>
+        <div id="duck-note" class="device-note"></div>
     </div>
 </div>
 <div class="buttons">
@@ -1131,6 +1394,8 @@ local function toggleDictionaryEditor()
     const deviceOptions = ]] .. deviceOptionsJson .. [[;
     const deviceSelect = document.getElementById('audio-device');
     const deviceNote = document.getElementById('device-note');
+    const duckLevelInput = document.getElementById('duck-level');
+    const duckNote = document.getElementById('duck-note');
     const selectedAudioDevice = "]] .. escapedSelectedAudioDevice .. [[";
 
     for (const option of deviceOptions) {
@@ -1149,10 +1414,20 @@ local function toggleDictionaryEditor()
     deviceSelect.addEventListener('change', updateDeviceNote);
     updateDeviceNote();
 
+    function updateDuckNote() {
+        const raw = Number.parseInt(duckLevelInput.value, 10);
+        const level = Number.isFinite(raw) ? Math.max(0, Math.min(100, raw)) : 0;
+        duckNote.textContent = 'Playback will be reduced to ' + level + '% of the current app volume while recording.';
+    }
+
+    duckLevelInput.addEventListener('input', updateDuckNote);
+    updateDuckNote();
+
     function save() {
         const params = new URLSearchParams();
         params.set('data', document.getElementById('dict').value);
         params.set('audio_device', deviceSelect.value);
+        params.set('duck_level', duckLevelInput.value);
         window.location.href = 'hammerspoon://dict-save?' + params.toString();
     }
     function cancel() {
@@ -1194,6 +1469,8 @@ hs.hotkey.bind(config.hotkey_dictionary_editor.mods, config.hotkey_dictionary_ed
 log("bound dictionary hotkey: " .. config.hotkey_dictionary_editor.key)
 hs.hotkey.bind(config.hotkey_open_transcripts.mods, config.hotkey_open_transcripts.key, openTranscriptFolder)
 log("bound transcript hotkey: " .. config.hotkey_open_transcripts.key)
+hs.hotkey.bind(config.hotkey_toggle_ducking.mods, config.hotkey_toggle_ducking.key, toggleManualDucking)
+log("bound manual ducking hotkey: " .. config.hotkey_toggle_ducking.key)
 
 if config.pin_system_input_device then
     hs.audiodevice.watcher.setCallback(handleSystemAudioDeviceEvent)

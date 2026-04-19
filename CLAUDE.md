@@ -32,7 +32,7 @@ Local voice recording and transcription tool using whisper.cpp. Dual-platform: m
 
 ### macOS hotkeys
 - **Cmd+Alt+R** toggles recording on/off
-- **Cmd+Alt+C** opens dictionary editor
+- **Cmd+Alt+C** opens dictionary editor plus audio input picker
 - **Cmd+Alt+T** opens the transcript temp folder
 
 ### Linux hotkeys
@@ -57,7 +57,7 @@ Local voice recording and transcription tool using whisper.cpp. Dual-platform: m
 ## User config: `~/.local-voice-scribe/`
 
 ### macOS
-- **`config.lua`** (optional) — Lua table overriding behavior settings (`duck_enabled`, `server_idle_timeout`, hotkey bindings, etc.)
+- **`config.lua`** (optional) — Lua table overriding behavior settings (`duck_enabled`, `server_idle_timeout`, `audio_device`, hotkey bindings, etc.)
 - **`runtime.lua`** (installer-managed) — resolved paths for `ffmpeg_path`, `whisper_server_path`, `model_path`, etc.
 
 ### Linux

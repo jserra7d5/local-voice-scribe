@@ -14,6 +14,8 @@ local defaults = {
     duck_level = 10,
     duck_ramp_down = 0.5,
     duck_ramp_up = 1.0,
+    audio_device = nil,
+    pin_system_input_device = false,
     server_idle_timeout = 300,
     hotkey_toggle_recording = { mods = {"cmd", "alt"}, key = "R" },
     hotkey_dictionary_editor = { mods = {"cmd", "alt"}, key = "C" },
@@ -117,6 +119,32 @@ local function ensureDirectory(path)
     return false, err
 end
 
+local function configuredAudioDeviceQuery()
+    if type(config.audio_device) ~= "string" then return nil end
+    local query = trim(config.audio_device)
+    if not query or query == "" then return nil end
+    return query
+end
+
+local function resolveConfiguredAudioInputDevice()
+    local query = configuredAudioDeviceQuery()
+    if not query then return nil end
+
+    local queryLower = query:lower()
+    local partialMatch = nil
+    for _, device in ipairs(hs.audiodevice.allInputDevices() or {}) do
+        local name = device:name()
+        if name == query then
+            return device
+        end
+        if not partialMatch and name and name:lower():find(queryLower, 1, true) then
+            partialMatch = device
+        end
+    end
+
+    return partialMatch
+end
+
 local function transcriptFilename(startedAt, durationSeconds)
     local stamp = os.date("%Y-%m-%d_%H-%M-%S", math.floor(startedAt or hs.timer.secondsSinceEpoch()))
     local duration = math.max(1, math.floor(tonumber(durationSeconds) or 0))
@@ -201,6 +229,7 @@ local sessionId = 0
 local transcriptionStartedFor = nil
 local recordingStartedAt = nil
 local lastRecordingDurationSeconds = nil
+local lastResolvedAudioDeviceName = nil
 local idleResetTimer = nil
 local ffmpegSafetyTimer = nil
 local serverPollTimer = nil
@@ -216,6 +245,63 @@ end
 do
     local file = io.open(logFile, "w")
     if file then file:write("=== Hammerspoon reload " .. os.date() .. " ===\n"); file:close() end
+end
+
+local function recordingAudioInputSpecifier()
+    local query = configuredAudioDeviceQuery()
+    if not query then
+        lastResolvedAudioDeviceName = nil
+        return "default"
+    end
+
+    local device = resolveConfiguredAudioInputDevice()
+    if not device then
+        return nil, "Audio input device not found: " .. query
+    end
+
+    lastResolvedAudioDeviceName = device:name()
+    return lastResolvedAudioDeviceName
+end
+
+local function pinConfiguredSystemInputDevice(showAlertOnFailure)
+    if not config.pin_system_input_device then return true end
+
+    local query = configuredAudioDeviceQuery()
+    if not query then return true end
+
+    local device = resolveConfiguredAudioInputDevice()
+    if not device then
+        local err = "Pinned audio input device not found: " .. query
+        log(err)
+        if showAlertOnFailure then hs.alert.show(err, 5) end
+        return false
+    end
+
+    local current = hs.audiodevice.defaultInputDevice()
+    if current and current:uid() == device:uid() then
+        lastResolvedAudioDeviceName = device:name()
+        return true
+    end
+
+    if device:setDefaultInputDevice() then
+        lastResolvedAudioDeviceName = device:name()
+        log("set system default input device: " .. tostring(lastResolvedAudioDeviceName))
+        return true
+    end
+
+    local err = "Could not select system input device: " .. tostring(device:name())
+    log(err)
+    if showAlertOnFailure then hs.alert.show(err, 5) end
+    return false
+end
+
+local function handleSystemAudioDeviceEvent(event)
+    if not config.pin_system_input_device then return end
+    if event ~= "dev#" and event ~= "dIn " then return end
+
+    hs.timer.doAfter(0.2, function()
+        pinConfiguredSystemInputDevice(false)
+    end)
 end
 
 local function ensureWhisperDependencies()
@@ -484,6 +570,9 @@ httpServer:setCallback(function(method, path, headers, body)
             state = currentState,
             install_token = installToken,
             repo_root = config.repo_root,
+            audio_device = config.audio_device,
+            pin_system_input_device = config.pin_system_input_device,
+            resolved_audio_device = lastResolvedAudioDeviceName,
             ffmpeg_path = ffmpegPath,
             whisper_server_path = whisperServerPath,
             whisper_public_path = whisperPublicPath,
@@ -581,6 +670,14 @@ end
 local function startRecording()
     if not ensureFfmpegDependency() then return end
     if not ensureWhisperDependencies() then return end
+    if not pinConfiguredSystemInputDevice(true) then return end
+
+    local audioInputSpecifier, audioErr = recordingAudioInputSpecifier()
+    if not audioInputSpecifier then
+        log(audioErr)
+        hs.alert.show(audioErr, 5)
+        return
+    end
 
     sessionId = sessionId + 1
     transcriptionStartedFor = nil
@@ -588,6 +685,7 @@ local function startRecording()
     local gen = sessionId
     updateState("recording")
     log("startRecording session=" .. gen)
+    log("recording audio input=" .. tostring(lastResolvedAudioDeviceName or audioInputSpecifier))
     recordingStartedAt = hs.timer.secondsSinceEpoch()
 
     -- Cancel any pending idle reset from previous complete state
@@ -624,7 +722,7 @@ local function startRecording()
             startTranscriptionOnce(gen)
         end
     end, {
-        "-y", "-f", "avfoundation", "-i", ":default",
+        "-y", "-f", "avfoundation", "-i", ":" .. audioInputSpecifier,
         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
         tempAudioFile
     })
@@ -792,6 +890,7 @@ end
 
 -- Dictionary editor webview
 local dictWebview = nil
+local persistAudioDeviceSelection
 
 local function closeDictEditor()
     if dictWebview then dictWebview:delete(); dictWebview = nil end
@@ -800,16 +899,27 @@ end
 hs.urlevent.bind("dict-save", function(eventName, params)
     log("urlevent dict-save received")
     local data = params.data or ""
+    local count = 0
+    for line in data:gmatch("[^\n]+") do
+        if line:match("%S") then count = count + 1 end
+    end
     local file = io.open(dictionaryFile, "w")
     if file then
         file:write(data)
         file:close()
-        local count = 0
-        for line in data:gmatch("[^\n]+") do
-            if line:match("%S") then count = count + 1 end
-        end
-        hs.alert.show("Dictionary saved (" .. count .. " words)")
+    else
+        hs.alert.show("Could not write dictionary", 5)
+        return
     end
+    local ok, err = persistAudioDeviceSelection(params.audio_device)
+    if not ok then
+        hs.alert.show(err, 5)
+        return
+    end
+    if config.pin_system_input_device then
+        pinConfiguredSystemInputDevice(false)
+    end
+    hs.alert.show("Settings saved (" .. count .. " dictionary entries)")
     closeDictEditor()
 end)
 
@@ -826,6 +936,108 @@ local function readDictionaryRaw()
     return content
 end
 
+local function readFileRaw(path)
+    local file = io.open(path, "r")
+    if not file then return nil end
+    local content = file:read("*a")
+    file:close()
+    return content
+end
+
+local function luaStringLiteral(value)
+    return string.format("%q", tostring(value))
+end
+
+persistAudioDeviceSelection = function(selection)
+    local normalized = trim(selection)
+    if normalized == "" then normalized = nil end
+
+    local existing = readFileRaw(configFile)
+    if not existing or existing == "" then
+        if not normalized then
+            config.audio_device = nil
+            lastResolvedAudioDeviceName = nil
+            return true
+        end
+
+        local file, err = io.open(configFile, "w")
+        if not file then
+            return false, "Could not open config.lua for writing: " .. tostring(err)
+        end
+        file:write("return {\n    audio_device = " .. luaStringLiteral(normalized) .. ",\n}\n")
+        file:close()
+        config.audio_device = normalized
+        lastResolvedAudioDeviceName = nil
+        return true
+    end
+
+    local replacement = "    audio_device = " .. (normalized and luaStringLiteral(normalized) or "nil") .. ","
+    local lines = {}
+    for line in (existing .. "\n"):gmatch("([^\n]*)\n") do
+        table.insert(lines, line)
+    end
+
+    local replaced = false
+    local closingIndex = nil
+    for i, line in ipairs(lines) do
+        if line:match("^%s*audio_device%s*=") then
+            local indent = line:match("^(%s*)") or "    "
+            lines[i] = indent .. "audio_device = " .. (normalized and luaStringLiteral(normalized) or "nil") .. ","
+            replaced = true
+        end
+        if line:match("^%s*}%s*$") then
+            closingIndex = i
+        end
+    end
+
+    if not replaced then
+        if not closingIndex then
+            return false, "Could not update config.lua automatically"
+        end
+        table.insert(lines, closingIndex, replacement)
+    end
+
+    local file, err = io.open(configFile, "w")
+    if not file then
+        return false, "Could not open config.lua for writing: " .. tostring(err)
+    end
+    file:write(table.concat(lines, "\n"))
+    file:close()
+
+    config.audio_device = normalized
+    lastResolvedAudioDeviceName = nil
+    return true
+end
+
+local function audioDeviceOptionsJson()
+    local options = {{
+        name = "",
+        label = "System Default",
+        detail = "Use whatever macOS currently exposes as the default input",
+    }}
+
+    local currentDefault = hs.audiodevice.defaultInputDevice()
+    for _, device in ipairs(hs.audiodevice.allInputDevices() or {}) do
+        local name = device:name()
+        if name then
+            local detail = {}
+            if currentDefault and currentDefault:uid() == device:uid() then
+                table.insert(detail, "Current macOS default")
+            end
+            if config.audio_device == name then
+                table.insert(detail, "Current Voice Scribe override")
+            end
+            table.insert(options, {
+                name = name,
+                label = name,
+                detail = table.concat(detail, " | "),
+            })
+        end
+    end
+
+    return hs.json.encode(options)
+end
+
 local function toggleDictionaryEditor()
     log("toggleDictionaryEditor called")
     local ok, err = pcall(function()
@@ -835,10 +1047,13 @@ local function toggleDictionaryEditor()
     end
 
     local screen = hs.screen.mainScreen():frame()
-    local w, h = 400, 300
+    local w, h = 760, 420
     local rect = hs.geometry.rect(screen.x + (screen.w - w) / 2, screen.y + (screen.h - h) / 2, w, h)
 
     local content = readDictionaryRaw():gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"):gsub("'", "&#39;")
+    local selectedAudioDevice = config.audio_device or ""
+    local escapedSelectedAudioDevice = selectedAudioDevice:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"):gsub("'", "&#39;")
+    local deviceOptionsJson = audioDeviceOptionsJson()
 
     local html = [[
 <!DOCTYPE html>
@@ -848,16 +1063,40 @@ local function toggleDictionaryEditor()
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
         background: #1e1e1e; color: #d4d4d4; font-family: -apple-system, sans-serif;
-        padding: 12px; display: flex; flex-direction: column; height: 100vh;
+        padding: 14px; display: flex; flex-direction: column; height: 100vh; gap: 12px;
     }
-    h3 { font-size: 13px; margin-bottom: 8px; color: #888; font-weight: 500; }
+    .layout {
+        flex: 1; display: flex; gap: 12px; min-height: 0;
+    }
+    .main, .sidebar {
+        background: #252526; border: 1px solid #3a3a3a; border-radius: 8px;
+    }
+    .main {
+        flex: 1; padding: 12px; display: flex; flex-direction: column; min-height: 0;
+    }
+    .sidebar {
+        width: 250px; padding: 12px; display: flex; flex-direction: column; gap: 10px;
+    }
+    h3 { font-size: 13px; margin-bottom: 8px; color: #9da3af; font-weight: 600; }
+    .subtle {
+        color: #8b949e; font-size: 12px; line-height: 1.4;
+    }
     textarea {
         flex: 1; background: #2d2d2d; color: #d4d4d4; border: 1px solid #444;
         border-radius: 4px; padding: 8px; font-size: 14px; font-family: 'SF Mono', Menlo, monospace;
         resize: none; outline: none;
     }
     textarea:focus { border-color: #666; }
-    .buttons { margin-top: 8px; display: flex; gap: 8px; justify-content: flex-end; }
+    select {
+        width: 100%; background: #2d2d2d; color: #d4d4d4; border: 1px solid #444;
+        border-radius: 6px; padding: 8px; font-size: 13px; outline: none;
+    }
+    select:focus { border-color: #666; }
+    .device-note {
+        min-height: 38px; background: #1f1f1f; border-radius: 6px; padding: 8px;
+        color: #a9b1ba; font-size: 12px; line-height: 1.4;
+    }
+    .buttons { display: flex; gap: 8px; justify-content: flex-end; }
     button {
         padding: 6px 16px; border: none; border-radius: 4px; font-size: 13px; cursor: pointer;
     }
@@ -868,15 +1107,53 @@ local function toggleDictionaryEditor()
 </style>
 </head>
 <body>
-<h3>Whisper Dictionary (one word per line, or: wrong -> right)</h3>
-<textarea id="dict" autofocus>]] .. content .. [[</textarea>
+<div class="layout">
+    <div class="main">
+        <h3>Whisper Dictionary</h3>
+        <div class="subtle" style="margin-bottom: 8px;">One word per line, or <code>wrong -> right</code>.</div>
+        <textarea id="dict" autofocus>]] .. content .. [[</textarea>
+    </div>
+    <div class="sidebar">
+        <div>
+            <h3>Input Device</h3>
+            <div class="subtle">Choose which microphone Voice Scribe should record from.</div>
+        </div>
+        <select id="audio-device"></select>
+        <div id="device-note" class="device-note"></div>
+        <div class="subtle">This sets the app's recording input. It does not need to follow the active Bluetooth device.</div>
+    </div>
+</div>
 <div class="buttons">
     <button class="cancel" onclick="cancel()">Cancel</button>
     <button class="save" onclick="save()">Save</button>
 </div>
 <script>
+    const deviceOptions = ]] .. deviceOptionsJson .. [[;
+    const deviceSelect = document.getElementById('audio-device');
+    const deviceNote = document.getElementById('device-note');
+    const selectedAudioDevice = "]] .. escapedSelectedAudioDevice .. [[";
+
+    for (const option of deviceOptions) {
+        const el = document.createElement('option');
+        el.value = option.name;
+        el.textContent = option.label;
+        if (option.name === selectedAudioDevice) el.selected = true;
+        deviceSelect.appendChild(el);
+    }
+
+    function updateDeviceNote() {
+        const current = deviceOptions.find(option => option.name === deviceSelect.value);
+        deviceNote.textContent = current && current.detail ? current.detail : 'Voice Scribe will use the selected input on the next recording.';
+    }
+
+    deviceSelect.addEventListener('change', updateDeviceNote);
+    updateDeviceNote();
+
     function save() {
-        window.location.href = 'hammerspoon://dict-save?data=' + encodeURIComponent(document.getElementById('dict').value);
+        const params = new URLSearchParams();
+        params.set('data', document.getElementById('dict').value);
+        params.set('audio_device', deviceSelect.value);
+        window.location.href = 'hammerspoon://dict-save?' + params.toString();
     }
     function cancel() {
         window.location.href = 'hammerspoon://dict-cancel';
@@ -893,7 +1170,7 @@ local function toggleDictionaryEditor()
     dictWebview = hs.webview.new(rect)
     dictWebview:windowStyle({"titled", "closable", "resizable"})
     dictWebview:level(hs.canvas.windowLevels.floating)
-    dictWebview:windowTitle("Whisper Dictionary")
+    dictWebview:windowTitle("Whisper Dictionary & Input")
     dictWebview:allowTextEntry(true)
     dictWebview:deleteOnClose(true)
     dictWebview:html(html)
@@ -918,7 +1195,15 @@ log("bound dictionary hotkey: " .. config.hotkey_dictionary_editor.key)
 hs.hotkey.bind(config.hotkey_open_transcripts.mods, config.hotkey_open_transcripts.key, openTranscriptFolder)
 log("bound transcript hotkey: " .. config.hotkey_open_transcripts.key)
 
+if config.pin_system_input_device then
+    hs.audiodevice.watcher.setCallback(handleSystemAudioDeviceEvent)
+    hs.audiodevice.watcher.start()
+    pinConfiguredSystemInputDevice(false)
+    log("enabled system audio input pinning")
+end
+
 hs.shutdownCallback = function()
+    hs.audiodevice.watcher.stop()
     stopWhisperServer()
     restoreDuckState()
 end

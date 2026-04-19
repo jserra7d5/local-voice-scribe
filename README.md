@@ -63,7 +63,7 @@ The setup script will:
 ## User-managed files
 
 - `~/.local-voice-scribe/config.lua`
-  - optional overrides
+  - optional overrides such as `audio_device = "Built-in Microphone"`
   - loaded after the installer-managed runtime config
   - installer-owned path keys are ignored
 - `~/.local-voice-scribe/dictionary.txt`
@@ -103,7 +103,7 @@ For a non-mutating verification pass:
 
 ### macOS
 - `Cmd+Alt+R` toggles recording
-- `Cmd+Alt+C` opens the floating dictionary editor
+- `Cmd+Alt+C` opens the floating dictionary editor and input-device picker
 - `Cmd+Alt+T` opens the transcript temp folder in Finder
 - Hammerspoon starts `whisper-server` on load and shuts it down after an idle timeout
 

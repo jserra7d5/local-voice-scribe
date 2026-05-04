@@ -216,11 +216,65 @@ EOF
   [ -f "$runtime_dir/whisper/public/index.html" ]
 }
 
+case_linux_launcher_is_installed_outside_repo() {
+  local sandbox home_dir runtime_dir mockbin launcher runtime_json
+  sandbox="$(mktemp -d)"
+  home_dir="$sandbox/home"
+  runtime_dir="$home_dir/.local-voice-scribe"
+  mockbin="$sandbox/mockbin"
+  launcher="$runtime_dir/bin/local-voice-scribe-linux"
+  runtime_json="$runtime_dir/runtime.json"
+
+  mkdir -p "$home_dir" "$mockbin"
+  : > "$mockbin/ffmpeg"
+  chmod +x "$mockbin/ffmpeg"
+
+  HOME="$home_dir" LVS_CONFIG_DIR="$runtime_dir" PATH="$mockbin:$PATH" \
+    bash -c "source '$ROOT/scripts/setup-linux.sh'; PYTHON_BIN=python3; create_launcher_script; write_runtime_config test-token ''" >/dev/null
+
+  [ -x "$launcher" ]
+  grep -F "cd \"$ROOT\" || exit 1" "$launcher" >/dev/null
+  python3 - "$runtime_json" "$launcher" <<'PY'
+import json
+import sys
+
+runtime = json.load(open(sys.argv[1]))
+assert runtime["launcher_path"] == sys.argv[2]
+assert runtime["repo_root"]
+assert runtime["install_token"] == "test-token"
+PY
+  [ ! -e "$ROOT/local-voice-scribe-linux" ] || git -C "$ROOT" check-ignore -q local-voice-scribe-linux
+}
+
+case_linux_build_skips_existing_server_with_yes() {
+  local sandbox home_dir runtime_dir mockbin
+  sandbox="$(mktemp -d)"
+  home_dir="$sandbox/home"
+  runtime_dir="$home_dir/.local-voice-scribe"
+  mockbin="$sandbox/mockbin"
+
+  mkdir -p "$runtime_dir/whisper/bin" "$mockbin"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$runtime_dir/whisper/bin/whisper-server"
+  chmod +x "$runtime_dir/whisper/bin/whisper-server"
+
+  cat > "$mockbin/cmake" <<'EOF'
+#!/usr/bin/env bash
+printf 'cmake should not be called when whisper-server already exists with --yes\n' >&2
+exit 1
+EOF
+  chmod +x "$mockbin/cmake"
+
+  HOME="$home_dir" LVS_CONFIG_DIR="$runtime_dir" PATH="$mockbin:$PATH" \
+    bash -c "source '$ROOT/scripts/setup-linux.sh'; AUTO_YES=1; build_whisper_server" >/dev/null
+}
+
 run_expect_failure "unmanaged-init-aborts" case_unmanaged_init_aborts
 run_expect_success "managed-block-updates" case_managed_block_updates
 run_expect_success "runtime-file-contains-token" case_runtime_file_contains_token
 run_expect_success "doctor-succeeds-with-matching-token" case_doctor_succeeds_with_matching_token
 run_expect_success "build-installs-runtime-libs" case_build_installs_runtime_libs
+run_expect_success "linux-launcher-is-installed-outside-repo" case_linux_launcher_is_installed_outside_repo
+run_expect_success "linux-build-skips-existing-server-with-yes" case_linux_build_skips_existing_server_with_yes
 
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]

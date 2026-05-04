@@ -216,7 +216,15 @@ build_whisper_server() {
   # Skip rebuild if binary already exists and is executable
   if [ -x "$WHISPER_SERVER_DEST" ]; then
     log "whisper-server already built at $WHISPER_SERVER_DEST"
-    confirm "Rebuild whisper-server? [y/N] "
+    if [ "$AUTO_YES" -eq 1 ]; then
+      return
+    fi
+    local rebuild_reply
+    read -r -p "Rebuild whisper-server? [y/N] " rebuild_reply
+    case "${rebuild_reply:-n}" in
+      y|Y|yes|YES) ;;
+      *) return ;;
+    esac
   fi
 
   local source_archive temp_root source_root build_dir cuda_arch built_server
@@ -290,8 +298,9 @@ data = {
     'install_token': sys.argv[4],
     'repo_root': sys.argv[5],
     'audio_device': sys.argv[6] if sys.argv[6] else None,
+    'launcher_path': sys.argv[7],
 }
-with open(sys.argv[7], 'w') as f:
+with open(sys.argv[8], 'w') as f:
     json.dump(data, f, indent=4)
 " \
     "$(command -v ffmpeg)" \
@@ -300,11 +309,13 @@ with open(sys.argv[7], 'w') as f:
     "$install_token" \
     "$REPO_ROOT" \
     "${audio_device:-}" \
+    "$LAUNCHER_SCRIPT" \
     "$RUNTIME_JSON"
   log "Runtime config written to $RUNTIME_JSON"
 }
 
 create_launcher_script() {
+  mkdir -p "$(dirname "$LAUNCHER_SCRIPT")"
   cat > "$LAUNCHER_SCRIPT" <<EOF
 #!/usr/bin/env bash
 # Local Voice Scribe - Linux launcher
@@ -357,14 +368,16 @@ doctor() {
 
   [ -f "$RUNTIME_JSON" ] || die "Missing runtime config at $RUNTIME_JSON"
 
-  local runtime_ffmpeg runtime_server runtime_model
+  local runtime_ffmpeg runtime_server runtime_model runtime_launcher
   runtime_ffmpeg="$(python3 -c "import json; print(json.load(open('$RUNTIME_JSON')).get('ffmpeg_path',''))" 2>/dev/null || true)"
   runtime_server="$(python3 -c "import json; print(json.load(open('$RUNTIME_JSON')).get('whisper_server_path',''))" 2>/dev/null || true)"
   runtime_model="$(python3 -c "import json; print(json.load(open('$RUNTIME_JSON')).get('model_path',''))" 2>/dev/null || true)"
+  runtime_launcher="$(python3 -c "import json; print(json.load(open('$RUNTIME_JSON')).get('launcher_path',''))" 2>/dev/null || true)"
 
   [ -x "$runtime_ffmpeg" ] || die "ffmpeg not found at $runtime_ffmpeg"
   [ -x "$runtime_server" ] || die "Missing whisper-server at $runtime_server"
   [ -f "$runtime_model" ] || die "Missing model at $runtime_model"
+  [ -x "$runtime_launcher" ] || die "Missing launcher at $runtime_launcher"
   [ "$(sha256_file "$runtime_model")" = "$MODEL_SHA256" ] || die "Model checksum mismatch at $runtime_model"
 
   [ -d "$VENV_DIR" ] || die "Python venv missing at $VENV_DIR"
@@ -392,7 +405,7 @@ Local Voice Scribe (Linux) doctor check passed.
   - Focusrite Scarlett: $audio_status
   - Python venv: $VENV_DIR
   - whisper-server: $runtime_server
-  - launcher: $LAUNCHER_SCRIPT
+  - launcher: $runtime_launcher
 EOF
 }
 
@@ -502,7 +515,7 @@ CACHE_DIR="$CONFIG_DIR/cache"
 WHISPER_HOME="$CONFIG_DIR/whisper"
 WHISPER_SERVER_DEST="$WHISPER_HOME/bin/whisper-server"
 VENV_DIR="$CONFIG_DIR/venv"
-LAUNCHER_SCRIPT="$REPO_ROOT/local-voice-scribe-linux"
+LAUNCHER_SCRIPT="$CONFIG_DIR/bin/local-voice-scribe-linux"
 DESKTOP_FILE="$HOME/.local/share/applications/local-voice-scribe.desktop"
 AUTOSTART_FILE="$HOME/.config/autostart/local-voice-scribe.desktop"
 BUILD_JOBS="${BUILD_JOBS:-$(nproc 2>/dev/null || echo 4)}"

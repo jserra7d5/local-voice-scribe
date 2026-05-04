@@ -540,7 +540,11 @@ class Daemon:
         else:
             repo_root = Path(__file__).resolve().parent.parent
 
-        launcher = repo_root / "local-voice-scribe-linux"
+        launcher_path = self.config.get("launcher_path")
+        if launcher_path:
+            launcher = Path(launcher_path)
+        else:
+            launcher = cfg.CONFIG_DIR / "bin" / "local-voice-scribe-linux"
         if not launcher.exists():
             raise FileNotFoundError(f"Launcher not found: {launcher}")
 

@@ -57,7 +57,7 @@ The setup script will:
 - installer-managed runtime config at `~/.local-voice-scribe/runtime.json`
 - source-built `whisper-server` (CUDA) at `~/.local-voice-scribe/whisper/bin/whisper-server`
 - Python venv at `~/.local-voice-scribe/venv/`
-- launcher script at `local-voice-scribe-linux` (project root)
+- launcher script at `~/.local-voice-scribe/bin/local-voice-scribe-linux`
 - XDG desktop entry and autostart entry
 
 ## User-managed files
@@ -93,10 +93,20 @@ Rerun:
 
 This is safe to rerun. It updates the managed Hammerspoon loader block, rewrites `runtime.lua`, re-verifies the model checksum, and rebuilds the pinned `whisper-server` if needed.
 
+On Linux:
+
+```bash
+./scripts/setup-linux.sh --yes
+```
+
+This is safe to rerun. It rewrites `runtime.json`, updates the generated launcher under `~/.local-voice-scribe/bin/`, re-verifies the model checksum, refreshes desktop/autostart entries, and rebuilds the pinned CUDA `whisper-server` if needed.
+
 For a non-mutating verification pass:
 
 ```bash
 ./scripts/setup.sh --doctor
+# or on Linux
+./scripts/setup-linux.sh --doctor
 ```
 
 ## How it works
@@ -126,14 +136,20 @@ For a non-mutating verification pass:
 - If setup refuses to touch `~/.hammerspoon/init.lua`, merge the printed managed block manually.
 - If setup says the status server did not expose the expected install token, Hammerspoon did not load the new config. Check `~/.hammerspoon/init.lua` and `/tmp/whisper_debug.log`.
 - If `whisper-server` does not start, check `/tmp/whisper_debug.log`.
-- If you move the repo, rerun `./scripts/setup.sh --yes` so the managed loader block points at the new path.
+- If you move the repo, rerun `./scripts/setup.sh --yes` on macOS or `./scripts/setup-linux.sh --yes` on Linux so installer-managed paths point at the new location.
 
-## Docker preflight
+## Installer tests
 
-The repo includes shell-level installer tests that can run in Docker:
+The repo includes shell-level installer tests:
 
 ```bash
 ./scripts/test-installer.sh
 ```
 
-This validates the installer logic and failure handling. It does not prove the real macOS path, because Docker cannot exercise Hammerspoon, macOS permissions, or `ffmpeg -f avfoundation`.
+This validates the installer logic and failure handling. It does not prove the real macOS path, because shell tests cannot exercise Hammerspoon, macOS permissions, or `ffmpeg -f avfoundation`.
+
+To run the same tests in Docker when desired:
+
+```bash
+./scripts/test-installer.sh --docker
+```

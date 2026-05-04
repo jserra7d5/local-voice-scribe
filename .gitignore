@@ -4,9 +4,12 @@
 *.bak
 *.orig
 *.rej
+*.py[cod]
 
 .idea/
 .vscode/
 
 build/
 cmake-build-*/
+__pycache__/
+local-voice-scribe-linux

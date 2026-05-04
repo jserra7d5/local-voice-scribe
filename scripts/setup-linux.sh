@@ -14,7 +14,7 @@ Install/update mode will:
   - download and verify the large-v3-turbo whisper model (~1.6 GB)
   - download and build whisper.cpp with CUDA GPU acceleration
   - create a Python virtual environment with pynput and PyQt6
-  - detect audio input devices (Focusrite Scarlett if connected)
+  - configure the system default audio input, with optional device selection later
   - write ~/.local-voice-scribe/runtime.json
   - create desktop launcher and autostart entries
 
@@ -457,9 +457,9 @@ main() {
   install_token="$(generate_install_token)"
   audio_device="$(detect_focusrite)"
   if [ -n "$audio_device" ]; then
-    log "Focusrite Scarlett detected: $audio_device"
+    log "Preferred audio input detected: $audio_device"
   else
-    log "No Focusrite Scarlett found. Will use system default audio input."
+    log "Will use system default audio input."
   fi
 
   write_runtime_config "$install_token" "$audio_device"

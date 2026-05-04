@@ -33,7 +33,7 @@ The setup script will:
 - download and verify the `ggml-large-v3-turbo` model
 - download and build a pinned `whisper.cpp` release with CUDA support
 - create a Python virtual environment with `pynput` and `PyQt6`
-- detect the Focusrite Scarlett audio device (if connected)
+- configure recording through the system default audio input
 - write `~/.local-voice-scribe/runtime.json`
 - create XDG desktop and autostart entries
 
@@ -62,8 +62,8 @@ The setup script will:
 
 ## User-managed files
 
-- `~/.local-voice-scribe/config.lua`
-  - optional overrides such as `audio_device = "Built-in Microphone"`
+- `~/.local-voice-scribe/config.json` on Linux or `config.lua` on macOS
+  - optional overrides such as `audio_device` on Linux
   - loaded after the installer-managed runtime config
   - installer-owned path keys are ignored
 - `~/.local-voice-scribe/dictionary.txt`
@@ -124,6 +124,7 @@ For a non-mutating verification pass:
 - Daemon starts `whisper-server` on launch and shuts it down after idle timeout
 - Floating red dot indicator during recording (PyQt6)
 - Settings window exposes ducking, hotkeys, audio input, and dictionary controls
+- Recording uses the system default audio input unless a specific microphone is selected in settings
 
 ### Both platforms
 - Successful transcriptions are copied to the clipboard and archived under `/tmp/local-voice-scribe-transcripts`

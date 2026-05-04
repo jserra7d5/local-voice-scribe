@@ -29,7 +29,7 @@ DEFAULTS = {
     "hotkey_toggle_recording": "super+alt+r",
     "hotkey_open_settings": "super+alt+c",
     "hotkey_open_transcripts": "super+alt+t",
-    "audio_device": None,  # auto-detect Focusrite Scarlett
+    "audio_device": None,
     "ffmpeg_path": None,
     "whisper_server_path": None,
     "model_path": None,

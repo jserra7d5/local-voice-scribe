@@ -127,7 +127,10 @@ class RestoreAlwaysGoesTo100(DuckingTestBase):
         runner = FakeRunner([
             {"id": 42, "binary": "strawberry", "values": [15155, 15155]},  # 23%
         ])
-        ctrl = self.make_controller(runner)
+        # duck_level=10 (target ~6554) is below the poisoned 23% start, so the
+        # duck still lowers it. (Ducking only ever lowers: a stream already
+        # below the target is left alone — covered by DuckIsIdempotent.)
+        ctrl = self.make_controller(runner, duck_level=10)
 
         ctrl.begin_session()
         self.assertTrue(
@@ -197,6 +200,52 @@ class CrashRecovery(DuckingTestBase):
         ctrl.recover_on_startup()
         self.assertEqual(runner.volume_of(5), [30000, 30000])
         self.assertEqual(runner.set_calls, [], "clean start must not move volumes")
+
+
+class DuckIsIdempotent(DuckingTestBase):
+    """The poll loop re-runs ducking every 0.25s to catch new streams. Doing so
+    must NOT compound the reduction on streams that are already ducked.
+
+    Regression: ducking scaled the stream's *current* volume each pass, so
+    repeated poll iterations multiplied the level geometrically
+    (level ~= (duck_level/100) ** (seconds/0.25)), driving a 90%-duck Spotify
+    toward silence within seconds."""
+
+    def _settle(self, predicate, timeout=1.0):
+        self.assertTrue(_wait_until(predicate, timeout=timeout))
+
+    def test_repeated_duck_passes_converge_to_absolute_target(self):
+        runner = FakeRunner([
+            {"id": 7, "binary": "spotify", "values": [FULL_VOLUME, FULL_VOLUME]},
+        ])
+        ctrl = self.make_controller(runner, duck_rules=[
+            {"match_binary": "spotify", "mode": "custom", "duck_level": 90},
+        ])
+        target = round(FULL_VOLUME * 90 / 100.0)
+
+        # Simulate many poll-loop iterations (the real loop fires ~4x/second).
+        for _ in range(12):
+            ctrl._duck_current_streams(ramp_seconds=0.0)
+            time.sleep(0.02)  # let the background apply-threads run
+
+        self._settle(lambda: runner.volume_of(7) == [target, target])
+        self.assertEqual(
+            runner.volume_of(7), [target, target],
+            f"duck compounded below target: got {runner.volume_of(7)}, "
+            f"expected [{target}, {target}] (90%)",
+        )
+
+    def test_default_level_does_not_compound(self):
+        runner = FakeRunner([
+            {"id": 1, "binary": "strawberry", "values": [FULL_VOLUME, FULL_VOLUME]},
+        ])
+        ctrl = self.make_controller(runner, duck_level=25)
+        target = round(FULL_VOLUME * 25 / 100.0)
+        for _ in range(10):
+            ctrl._duck_current_streams(ramp_seconds=0.0)
+            time.sleep(0.02)
+        self._settle(lambda: runner.volume_of(1) == [target, target])
+        self.assertEqual(runner.volume_of(1), [target, target])
 
 
 class MultiChannel(DuckingTestBase):

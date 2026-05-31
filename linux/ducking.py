@@ -209,14 +209,25 @@ class DuckingController:
             target_pct = self._target_percent_for_stream(stream)
             if target_pct >= 100:
                 continue  # bypass rule (or nothing to lower)
-            target_values = self._scaled_values(stream["channel_values"], target_pct)
+            # Target is ABSOLUTE — a fraction of unity, not of the stream's
+            # current level. The poll loop re-runs this every 0.25s to catch
+            # newly started streams; scaling the *current* value instead would
+            # compound the duck on already-ducked streams every pass
+            # (level ~= (pct/100) ** (seconds/0.25)) and drive playback toward
+            # silence. Anchoring to unity makes re-ducking idempotent and fits
+            # the "every digital stream sits at 100%" rule.
+            current = stream["channel_values"]
+            target = round(FULL_VOLUME * target_pct / 100.0)
+            target_values = [target] * len(current)
+            if max(current) <= target:
+                continue  # already at/below target — leave it (idempotent)
             self.log(
                 f"duck id={stream['id']} binary={stream['binary']} "
-                f"from={stream['channel_values']} to={target_values}"
+                f"from={current} to={target_values}"
             )
             self._ramp(
                 stream["id"],
-                stream["channel_values"],
+                current,
                 target_values,
                 ramp_seconds,
                 epoch=epoch,
@@ -254,9 +265,6 @@ class DuckingController:
                 return 100
             return max(0, min(100, int(rule.get("duck_level", self.config.get("duck_level", 10)))))
         return max(0, min(100, int(self.config.get("duck_level", 10))))
-
-    def _scaled_values(self, original_values: list[int], percent: int) -> list[int]:
-        return [max(0, round(value * percent / 100.0)) for value in original_values]
 
     def _ramp(
         self,

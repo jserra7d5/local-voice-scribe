@@ -50,7 +50,10 @@ Local voice recording and transcription tool using whisper.cpp. Dual-platform: m
 ## Features
 
 - **Whisper server management**: Model stays loaded in memory between transcriptions for sub-second latency. Auto-starts, auto-shuts down after idle timeout. Cleaned up on Hammerspoon reload/shutdown.
-- **Audio ducking**: Lowers Music/Spotify volume to 10% while recording with smooth 0.5s ramp down and 1.0s ramp up. Duck state is persisted to `/tmp/whisper_duck_state.txt` so volumes are restored even if Hammerspoon crashes/reloads.
+- **Audio ducking**: Lowers playback (Music/Spotify/etc.) volume while recording with smooth 0.5s ramp down and 1.0s ramp up, then restores when recording stops.
+  - **macOS**: ducks to a configured level; duck state persisted to `/tmp/whisper_duck_state.txt` so volumes restore even if Hammerspoon crashes/reloads.
+  - **Linux** (`linux/ducking.py`): hardened model — ducking only ever *lowers*; **restore always returns streams to 100% (unity)**. It never captures or trusts an "original" volume, so a stream left ducked (crash, missed `end_session`, app restart) can never poison a later restore. This deliberately matches the rig where per-app digital volume is always 100% and loudness is set on the analog amp. Crash safety: `/tmp/whisper_duck_state.txt` is a presence marker written for the session's duration; on startup `recover_on_startup()` sees a leftover marker and restores everything to 100%. Per-app behavior via `duck_level` + `duck_rules` (`bypass` skips an app, e.g. Firefox; `custom` sets its duck level, e.g. Spotify 50%). Covered by `tests/test_ducking.py`.
+  - **Linux diagnosis tip**: if a music app is mysteriously quiet, check its *per-stream* volume with `pactl list sink-inputs` (the sink can read 100% while an individual app stream is ducked low). Duck/restore activity is logged in `/tmp/whisper_debug.log`.
 - **Border flash indicators**: Red persistent border while recording, yellow flash on stop (transcribing), green flash on transcription complete.
 - **Alerts**: Positioned at top of screen via `hs.alert.defaultStyle.atScreenEdge = 1`.
 
@@ -81,13 +84,14 @@ The Linux daemon (`linux/`) is a Python package mirroring the macOS init.lua fea
 - `recorder.py` — ffmpeg recording via PulseAudio backend with Focusrite auto-detection
 - `server.py` — whisper-server lifecycle (launch, health check, idle shutdown)
 - `transcriber.py` — HTTP POST to whisper-server `/inference` endpoint
+- `ducking.py` — per-stream playback ducking via pactl; restores to 100% (see Audio ducking in Features)
 - `overlay.py` — PyQt6 floating recording indicator (red dot) + dictionary editor dialog
 - `config.py`, `clipboard.py`, `notifications.py` — system integration
 
 ## State files
 
 - `/tmp/whisper_state.txt` — current state (idle/recording/transcribing/complete)
-- `/tmp/whisper_duck_state.txt` — saved app volumes during ducking (safety restore)
+- `/tmp/whisper_duck_state.txt` — ducking crash-safety. macOS: saved app volumes. Linux: a presence marker for the session's duration; if found at startup, all streams are restored to 100%.
 - `/tmp/whisper_recording.wav` — temporary audio file (deleted after transcription)
 - `/tmp/local-voice-scribe-transcripts/` — archived successful transcripts as `transcript_YYYY-MM-DD_HH-MM-SS__dur-NNs.txt`
 - `/tmp/whisper_debug.log` — debug log (cleared on each Hammerspoon reload)

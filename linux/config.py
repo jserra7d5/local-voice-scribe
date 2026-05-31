@@ -9,6 +9,7 @@ USER_CONFIG_FILE = CONFIG_DIR / "config.json"
 DICTIONARY_FILE = CONFIG_DIR / "dictionary.txt"
 LOG_FILE = Path("/tmp/whisper_debug.log")
 STATE_FILE = Path("/tmp/whisper_state.txt")
+DUCK_STATE_FILE = Path("/tmp/whisper_duck_state.txt")
 TRANSCRIPT_DIR = Path("/tmp/local-voice-scribe-transcripts")
 TEMP_AUDIO_FILE = Path("/tmp/whisper_recording.wav")
 RECORDING_HISTORY_DIR = CONFIG_DIR / "recordings"

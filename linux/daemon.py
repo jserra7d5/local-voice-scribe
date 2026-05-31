@@ -113,6 +113,10 @@ class Daemon:
         self.log("daemon starting")
         self.update_state("idle")
 
+        # Recover from a previous run that crashed mid-duck: if a duck marker is
+        # present, restore all playback streams to 100% before doing anything else.
+        self.ducking.recover_on_startup()
+
         # Signal handlers for clean shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)

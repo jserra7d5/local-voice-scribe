@@ -1,4 +1,15 @@
-"""Playback stream ducking for Linux via pactl."""
+"""Playback stream ducking for Linux via pactl.
+
+Hardened model: ducking only ever *lowers* volume; restoring always returns a
+stream to 100% (unity). No "original" volume is ever captured or trusted as the
+restore target, so a stream left ducked by a crash, a missed ``end_session``, or
+an app restart can never poison a later restore (the bug that left Strawberry /
+Spotify permanently quiet).
+
+Crash safety: a marker file (``cfg.DUCK_STATE_FILE``) exists for the duration of
+a ducking session. If the daemon dies mid-duck, the next startup sees the marker
+and restores every active playback stream to 100%.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +18,22 @@ import subprocess
 import threading
 import time
 
+from . import config as cfg
 from .notifications import notify
+
+# pactl integer volume for 100% (unity). pactl accepts raw integer values.
+FULL_VOLUME = 65536
+
+
+def _default_runner(args, *, timeout):
+    """Default command runner. Tests inject a fake with the same signature."""
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=True,
+    )
 
 
 def _parse_percent(value) -> int:
@@ -37,15 +63,17 @@ def _stream_display_name(stream: dict) -> str:
     )
 
 
-def list_active_streams() -> list[dict]:
-    """Return active playback streams and metadata needed for ducking/UI."""
+def list_active_streams(runner=None) -> list[dict]:
+    """Return active playback streams and metadata needed for ducking/UI.
+
+    ``runner`` is an optional command runner (defaults to a real subprocess);
+    tests pass a fake. The return shape is stable — ``settings.py`` consumes it.
+    """
+    run = runner or _default_runner
     try:
-        result = subprocess.run(
+        result = run(
             ["pactl", "--format=json", "list", "sink-inputs"],
-            capture_output=True,
-            text=True,
             timeout=3,
-            check=True,
         )
         raw_streams = json.loads(result.stdout or "[]")
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
@@ -66,13 +94,13 @@ def list_active_streams() -> list[dict]:
             if not isinstance(data, dict):
                 continue
             try:
-                channel_values.append(int(data.get("value", 65536)))
+                channel_values.append(int(data.get("value", FULL_VOLUME)))
             except (TypeError, ValueError):
-                channel_values.append(65536)
+                channel_values.append(FULL_VOLUME)
             channel_percents.append(_parse_percent(data.get("value_percent", "100%")))
 
         if not channel_values:
-            channel_values = [65536]
+            channel_values = [FULL_VOLUME]
         if not channel_percents:
             channel_percents = [100]
 
@@ -90,20 +118,31 @@ def list_active_streams() -> list[dict]:
 
 
 class DuckingController:
-    """Manage per-stream ducking during active recording sessions."""
+    """Lower playback volume during recording, always restore to 100%.
 
-    def __init__(self, app_config: dict, log_fn):
+    The controller is deliberately stateless about "original" volumes: it never
+    stores a per-stream baseline to restore to. Ducking lowers; restoring sets
+    everything it would duck back to unity. This makes a permanently-stuck
+    ducked stream impossible by construction.
+    """
+
+    def __init__(self, app_config: dict, log_fn, runner=None):
         self.config = app_config
         self.log = log_fn
-        self._saved_streams: dict[int, dict] = {}
+        self._runner = runner or _default_runner
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._session_active = False
+        # Bumped on every session boundary; in-flight duck ramps abort when it
+        # changes so a late duck step can never fight a restore.
+        self._epoch = 0
         self._warned_unavailable = False
 
     def update_config(self, app_config: dict):
         self.config = app_config
+
+    # ------------------------------------------------------------------ public
 
     def begin_session(self):
         if not self.config.get("duck_enabled"):
@@ -117,11 +156,12 @@ class DuckingController:
             if self._session_active:
                 return
             self._session_active = True
-            self._saved_streams = {}
+            self._epoch += 1
             self._stop_event.clear()
 
+        self._write_marker()
         self.log("ducking session start")
-        self._apply_current_streams(ramp_seconds=float(self.config.get("duck_ramp_down", 0.5)))
+        self._duck_current_streams(ramp_seconds=float(self.config.get("duck_ramp_down", 0.5)))
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
 
@@ -130,73 +170,79 @@ class DuckingController:
             if not self._session_active:
                 return
             self._session_active = False
+            self._epoch += 1  # invalidate any in-flight duck ramps
             self._stop_event.set()
-            saved = dict(self._saved_streams)
-            self._saved_streams = {}
 
-        self.log(f"ducking session stop; restoring {len(saved)} streams")
         thread = self._thread
         if thread and thread.is_alive():
             thread.join(timeout=1.0)
         self._thread = None
-        self._restore_streams(saved, ramp_seconds=float(self.config.get("duck_ramp_up", 1.0)))
+
+        self.log("ducking session stop; restoring to 100%")
+        self._restore_all(ramp_seconds=float(self.config.get("duck_ramp_up", 1.0)))
+        self._clear_marker()
+
+    def recover_on_startup(self):
+        """Restore streams to 100% if a previous run died mid-duck.
+
+        Runs regardless of ``duck_enabled`` — recovery must work even if the
+        user disabled ducking after the crash. No-op when no marker is present,
+        so a clean start never overrides deliberately-set volumes.
+        """
+        if not cfg.DUCK_STATE_FILE.exists():
+            return
+        self.log("duck marker present at startup; restoring streams to 100%")
+        if self._pactl_available():
+            self._restore_all(ramp_seconds=0.0)
+        self._clear_marker()
+
+    # --------------------------------------------------------------- internals
 
     def _poll_loop(self):
+        # Catch streams that start *during* a recording and duck them too.
         while not self._stop_event.wait(0.25):
-            self._apply_current_streams(ramp_seconds=0.0)
+            self._duck_current_streams(ramp_seconds=0.0)
 
-    def _apply_current_streams(self, ramp_seconds: float):
-        streams = list_active_streams()
-        if not streams:
-            return
-
-        for stream in streams:
-            with self._lock:
-                if stream["id"] in self._saved_streams:
-                    continue
-                self._saved_streams[stream["id"]] = {
-                    "binary": stream["binary"],
-                    "display_name": stream["display_name"],
-                    "channel_values": list(stream["channel_values"]),
-                }
-
+    def _duck_current_streams(self, ramp_seconds: float):
+        epoch = self._epoch
+        for stream in list_active_streams(self._runner):
             target_pct = self._target_percent_for_stream(stream)
+            if target_pct >= 100:
+                continue  # bypass rule (or nothing to lower)
             target_values = self._scaled_values(stream["channel_values"], target_pct)
             self.log(
-                f"duck stream id={stream['id']} binary={stream['binary']} "
+                f"duck id={stream['id']} binary={stream['binary']} "
                 f"from={stream['channel_values']} to={target_values}"
             )
-            self._set_stream_volume(
+            self._ramp(
                 stream["id"],
                 stream["channel_values"],
                 target_values,
                 ramp_seconds,
-                abort_on_stop=True,
+                epoch=epoch,
                 background=True,
             )
 
-    def _restore_streams(self, saved_streams: dict[int, dict], ramp_seconds: float):
-        if not saved_streams:
-            return
-
-        current_streams = {stream["id"]: stream for stream in list_active_streams()}
-        for stream_id, original in saved_streams.items():
-            current = current_streams.get(stream_id)
-            if not current:
-                self.log(f"restore skipped for vanished stream id={stream_id}")
-                continue
-            from_values = current["channel_values"]
-            to_values = original["channel_values"]
+    def _restore_all(self, ramp_seconds: float):
+        """Set every stream we would duck back to 100% (re-enumerated live)."""
+        for stream in list_active_streams(self._runner):
+            if self._target_percent_for_stream(stream) >= 100:
+                continue  # bypassed app — we never touched it
+            full = [FULL_VOLUME] * len(stream["channel_values"])
+            if stream["channel_values"] == full:
+                continue  # already at unity
             self.log(
-                f"restore stream id={stream_id} binary={original['binary']} "
-                f"from={from_values} to={to_values}"
+                f"restore id={stream['id']} binary={stream['binary']} "
+                f"from={stream['channel_values']} to={full}"
             )
-            self._set_stream_volume(
-                stream_id,
-                from_values,
-                to_values,
+            # Restore is authoritative: epoch=None so it never aborts and always
+            # snaps to exactly 100% at the end.
+            self._ramp(
+                stream["id"],
+                stream["channel_values"],
+                full,
                 ramp_seconds,
-                abort_on_stop=False,
+                epoch=None,
                 background=True,
             )
 
@@ -212,42 +258,44 @@ class DuckingController:
     def _scaled_values(self, original_values: list[int], percent: int) -> list[int]:
         return [max(0, round(value * percent / 100.0)) for value in original_values]
 
-    def _set_stream_volume(
+    def _ramp(
         self,
         stream_id: int,
         from_values: list[int],
         to_values: list[int],
         ramp_seconds: float,
         *,
-        abort_on_stop: bool,
+        epoch: int | None,
         background: bool,
     ):
         if background:
             threading.Thread(
-                target=self._ramp_stream_volume,
-                args=(stream_id, from_values, to_values, ramp_seconds, abort_on_stop),
+                target=self._ramp_blocking,
+                args=(stream_id, from_values, to_values, ramp_seconds, epoch),
                 daemon=True,
             ).start()
             return
-        self._ramp_stream_volume(stream_id, from_values, to_values, ramp_seconds, abort_on_stop)
+        self._ramp_blocking(stream_id, from_values, to_values, ramp_seconds, epoch)
 
-    def _ramp_stream_volume(
+    def _ramp_blocking(
         self,
         stream_id: int,
         from_values: list[int],
         to_values: list[int],
         ramp_seconds: float,
-        abort_on_stop: bool,
+        epoch: int | None,
     ):
         if ramp_seconds <= 0:
+            if epoch is not None and self._epoch != epoch:
+                return
             self._apply_volume(stream_id, to_values)
             return
 
         steps = 10
         interval = ramp_seconds / steps
         for step in range(1, steps + 1):
-            if abort_on_stop and self._stop_event.is_set():
-                return
+            if epoch is not None and self._epoch != epoch:
+                return  # session changed — abandon this duck ramp
             step_values = [
                 round(start + (target - start) * (step / steps))
                 for start, target in zip(from_values, to_values, strict=False)
@@ -257,32 +305,35 @@ class DuckingController:
             self._apply_volume(stream_id, step_values)
             if step < steps:
                 time.sleep(interval)
-        if abort_on_stop and self._stop_event.is_set():
+        if epoch is not None and self._epoch != epoch:
             return
         self._apply_volume(stream_id, to_values)
 
     def _apply_volume(self, stream_id: int, channel_values: list[int]):
         volumes = [str(max(0, int(value))) for value in channel_values]
         try:
-            subprocess.run(
+            self._runner(
                 ["pactl", "set-sink-input-volume", str(stream_id), *volumes],
-                capture_output=True,
-                text=True,
                 timeout=3,
-                check=True,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             self.log(f"set-sink-input-volume failed for #{stream_id}: {exc}")
 
+    def _write_marker(self):
+        try:
+            cfg.DUCK_STATE_FILE.write_text(json.dumps({"started_at": time.time()}))
+        except OSError as exc:
+            self.log(f"duck marker write failed: {exc}")
+
+    def _clear_marker(self):
+        try:
+            cfg.DUCK_STATE_FILE.unlink(missing_ok=True)
+        except OSError as exc:
+            self.log(f"duck marker clear failed: {exc}")
+
     def _pactl_available(self) -> bool:
         try:
-            subprocess.run(
-                ["pactl", "info"],
-                capture_output=True,
-                text=True,
-                timeout=2,
-                check=True,
-            )
+            self._runner(["pactl", "info"], timeout=2)
             return True
         except (OSError, subprocess.SubprocessError):
             return False

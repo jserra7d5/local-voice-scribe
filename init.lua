@@ -46,6 +46,7 @@ local runtimeOwnedKeys = {
 
 local log
 local ffmpegPath
+local lastResolvedAudioDeviceName = nil
 
 local function mergeConfig(candidate, source)
     if type(candidate) ~= "table" then return end
@@ -199,31 +200,55 @@ local function listAvfoundationAudioInputs()
     return inputs
 end
 
-local function avfoundationAudioInputSpecifier(device)
-    if not device then
-        lastResolvedAudioDeviceName = nil
-        return "default"
-    end
+local function avfoundationAudioInputSpecifierForName(name)
+    local query = trim(name)
+    if not query then return nil end
 
-    local deviceName = trim(device:name())
     local inputs, err = listAvfoundationAudioInputs()
     if not inputs then
         return nil, err
     end
 
     for _, input in ipairs(inputs) do
-        if input.name == deviceName then
-            lastResolvedAudioDeviceName = device:name()
+        if input.name == query then
+            lastResolvedAudioDeviceName = input.name
             return input.index
         end
     end
 
-    return nil, "Audio input device not available to ffmpeg: " .. tostring(device:name())
+    local queryLower = query:lower()
+    local partialMatch = nil
+    local partialMatchCount = 0
+    for _, input in ipairs(inputs) do
+        if input.name and input.name:lower():find(queryLower, 1, true) then
+            partialMatch = input
+            partialMatchCount = partialMatchCount + 1
+        end
+    end
+
+    if partialMatchCount == 1 then
+        lastResolvedAudioDeviceName = partialMatch.name
+        return partialMatch.index
+    end
+
+    if partialMatchCount > 1 then
+        return nil, "Audio input device name is ambiguous: " .. query
+    end
+
+    return nil, "Audio input device not available to ffmpeg: " .. query
+end
+
+local function avfoundationAudioInputSpecifier(device)
+    if not device then
+        lastResolvedAudioDeviceName = nil
+        return "default"
+    end
+    return avfoundationAudioInputSpecifierForName(device:name())
 end
 
 local function selectedAudioDeviceValue(device)
     if not device then return nil end
-    return device:uid() or device:name()
+    return device:name() or device:uid()
 end
 
 local function configuredAudioDeviceIsSelected(device)
@@ -242,9 +267,10 @@ local function configuredAudioDeviceDisplayName()
 end
 
 local function recordingAudioInputSpecifier()
+    local query = configuredAudioDeviceQuery()
     local device = resolveConfiguredAudioInputDevice()
-    if configuredAudioDeviceQuery() and not device then
-        return nil, "Audio input device not found: " .. tostring(configuredAudioDeviceDisplayName())
+    if query and not device then
+        return avfoundationAudioInputSpecifierForName(query)
     end
 
     local specifier, err = avfoundationAudioInputSpecifier(device)
@@ -343,7 +369,7 @@ local sessionId = 0
 local transcriptionStartedFor = nil
 local recordingStartedAt = nil
 local lastRecordingDurationSeconds = nil
-local lastResolvedAudioDeviceName = nil
+lastResolvedAudioDeviceName = nil
 local idleResetTimer = nil
 local ffmpegSafetyTimer = nil
 local serverPollTimer = nil
@@ -1256,11 +1282,13 @@ local function audioDeviceOptionsJson()
         label = "System Default",
         detail = "Use whatever macOS currently exposes as the default input",
     }}
+    local seenNames = {}
 
     local currentDefault = hs.audiodevice.defaultInputDevice()
     for _, device in ipairs(hs.audiodevice.allInputDevices() or {}) do
         local name = device:name()
         if name then
+            seenNames[name] = true
             local value = selectedAudioDeviceValue(device) or name
             local detail = {}
             if currentDefault and currentDefault:uid() == device:uid() then
@@ -1269,11 +1297,32 @@ local function audioDeviceOptionsJson()
             if configuredAudioDeviceIsSelected(device) then
                 table.insert(detail, "Current Voice Scribe override")
             end
+            if device:uid() then
+                table.insert(detail, "CoreAudio UID: " .. device:uid())
+            end
             table.insert(options, {
                 name = value,
                 label = name,
                 detail = table.concat(detail, " | "),
             })
+        end
+    end
+
+    local avfoundationInputs = listAvfoundationAudioInputs()
+    if avfoundationInputs then
+        for _, input in ipairs(avfoundationInputs) do
+            if input.name and not seenNames[input.name] then
+                local detail = "AVFoundation input"
+                if config.audio_device == input.name then
+                    detail = detail .. " | Current Voice Scribe override"
+                end
+                table.insert(options, {
+                    name = input.name,
+                    label = input.name,
+                    detail = detail,
+                })
+                seenNames[input.name] = true
+            end
         end
     end
 

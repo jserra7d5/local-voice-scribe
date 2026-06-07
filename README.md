@@ -113,7 +113,7 @@ For a non-mutating verification pass:
 
 ### macOS
 - `Cmd+Alt+R` toggles recording
-- `Cmd+Alt+C` opens the floating dictionary editor and input-device picker
+- `Cmd+Alt+C` opens the floating settings window for dictionary, input device, ducking, hotkeys, border flash, diagnostics, and recent transcripts
 - `Cmd+Alt+T` opens the transcript temp folder in Finder
 - Hammerspoon starts `whisper-server` on load and shuts it down after an idle timeout
 

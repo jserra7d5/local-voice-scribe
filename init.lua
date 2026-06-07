@@ -16,6 +16,10 @@ local defaults = {
     duck_ramp_up = 1.0,
     audio_device = nil,
     pin_system_input_device = false,
+    border_flash_enabled = true,
+    border_color_recording = "#ff2828",
+    border_color_transcribing = "#46aaff",
+    border_color_complete = "#28dc28",
     server_idle_timeout = 300,
     hotkey_toggle_recording = { mods = {"cmd", "alt"}, key = "R" },
     hotkey_dictionary_editor = { mods = {"cmd", "alt"}, key = "C" },
@@ -86,6 +90,26 @@ end
 local function trim(s)
     if type(s) ~= "string" then return nil end
     return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function normalizeColorHex(value, fallback)
+    local text = trim(value)
+    if type(text) == "string" then
+        text = text:lower()
+        if text:match("^#[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$") then
+            return text
+        end
+    end
+    return fallback
+end
+
+local function colorFromHex(hex)
+    local normalized = normalizeColorHex(hex, "#ff2828")
+    return {
+        red = tonumber(normalized:sub(2, 3), 16) / 255,
+        green = tonumber(normalized:sub(4, 5), 16) / 255,
+        blue = tonumber(normalized:sub(6, 7), 16) / 255,
+    }
 end
 
 local function shellQuote(s)
@@ -494,9 +518,9 @@ local borderFadeTimer = nil
 local borderGeneration = 0
 
 local borderColors = {
-    recording = { red = 1, green = 0.15, blue = 0.15 },
-    transcribing = { red = 1, green = 0.8, blue = 0 },
-    complete = { red = 0.15, green = 0.85, blue = 0.15 },
+    recording = colorFromHex(config.border_color_recording),
+    transcribing = colorFromHex(config.border_color_transcribing),
+    complete = colorFromHex(config.border_color_complete),
 }
 
 local function clearBorder()
@@ -505,6 +529,7 @@ local function clearBorder()
 end
 
 local function createBorder(color, alpha)
+    if not config.border_flash_enabled then return nil end
     clearBorder()
     borderGeneration = borderGeneration + 1
     local screen = hs.screen.mainScreen():fullFrame()
@@ -527,8 +552,10 @@ end
 local function showBorder(colorName) createBorder(borderColors[colorName], 0.9) end
 
 local function flashBorder(colorName)
+    if not config.border_flash_enabled then return end
     local color = borderColors[colorName]
     local gen = createBorder(color, 0.9)
+    if not gen then return end
     local steps = 11
     local step = 0
     borderFadeTimer = hs.timer.doEvery(0.05, function()
@@ -1074,6 +1101,8 @@ end
 local dictWebview = nil
 local persistAudioDeviceSelection
 local persistSettings
+local readFileRaw
+local openPath
 
 local function closeDictEditor()
     if dictWebview then dictWebview:delete(); dictWebview = nil end
@@ -1102,6 +1131,11 @@ hs.urlevent.bind("dict-save", function(eventName, params)
     if config.pin_system_input_device then
         pinConfiguredSystemInputDevice(false)
     end
+    borderColors = {
+        recording = colorFromHex(config.border_color_recording),
+        transcribing = colorFromHex(config.border_color_transcribing),
+        complete = colorFromHex(config.border_color_complete),
+    }
     hs.alert.show("Settings saved (" .. count .. " dictionary entries)")
     closeDictEditor()
 end)
@@ -1109,6 +1143,37 @@ end)
 hs.urlevent.bind("dict-cancel", function()
     log("urlevent dict-cancel received")
     closeDictEditor()
+end)
+
+hs.urlevent.bind("lvs-open-log", function()
+    log("urlevent lvs-open-log received")
+    openPath(logFile, true)
+end)
+
+hs.urlevent.bind("lvs-open-transcript", function(eventName, params)
+    local path = params.path
+    log("urlevent lvs-open-transcript received: " .. tostring(path))
+    if not openPath(path, false) then
+        hs.alert.show("Could not open transcript", 3)
+    end
+end)
+
+hs.urlevent.bind("lvs-copy-transcript", function(eventName, params)
+    local path = params.path
+    log("urlevent lvs-copy-transcript received: " .. tostring(path))
+    local content = readFileRaw(path)
+    if content then
+        hs.pasteboard.setContents(content)
+        hs.alert.show("Transcript copied", 2)
+    else
+        hs.alert.show("Could not copy transcript", 3)
+    end
+end)
+
+hs.urlevent.bind("lvs-reload", function()
+    log("urlevent lvs-reload received")
+    closeDictEditor()
+    hs.reload()
 end)
 
 local function readDictionaryRaw()
@@ -1119,7 +1184,8 @@ local function readDictionaryRaw()
     return content
 end
 
-local function readFileRaw(path)
+readFileRaw = function(path)
+    if type(path) ~= "string" or path == "" then return nil end
     local file = io.open(path, "r")
     if not file then return nil end
     local content = file:read("*a")
@@ -1131,6 +1197,21 @@ local function luaStringLiteral(value)
     return string.format("%q", tostring(value))
 end
 
+local function isArrayTable(value)
+    if type(value) ~= "table" then return false end
+    local count = 0
+    for key in pairs(value) do
+        if type(key) ~= "number" or key < 1 or math.floor(key) ~= key then
+            return false
+        end
+        count = count + 1
+    end
+    for i = 1, count do
+        if value[i] == nil then return false end
+    end
+    return true
+end
+
 local function serializeLuaValue(value)
     if value == nil then return "nil" end
 
@@ -1140,6 +1221,30 @@ local function serializeLuaValue(value)
     end
     if valueType == "number" or valueType == "boolean" then
         return tostring(value)
+    end
+    if valueType == "table" then
+        if isArrayTable(value) then
+            local pieces = {}
+            for _, item in ipairs(value) do
+                table.insert(pieces, serializeLuaValue(item))
+            end
+            return "{" .. table.concat(pieces, ", ") .. "}"
+        end
+
+        local keys = {}
+        for key in pairs(value) do
+            if type(key) ~= "string" then
+                error("Unsupported config table key type: " .. type(key))
+            end
+            table.insert(keys, key)
+        end
+        table.sort(keys)
+
+        local pieces = {}
+        for _, key in ipairs(keys) do
+            table.insert(pieces, key .. " = " .. serializeLuaValue(value[key]))
+        end
+        return "{ " .. table.concat(pieces, ", ") .. " }"
     end
 
     error("Unsupported config value type: " .. valueType)
@@ -1155,6 +1260,82 @@ local function normalizedDuckLevel(selection)
     if value < 0 then value = 0 end
     if value > 100 then value = 100 end
     return value
+end
+
+local function normalizedTimeout(selection)
+    local value = tonumber(trim(selection or ""))
+    if not value then
+        return nil, "Server idle timeout must be a number between 30 and 3600"
+    end
+
+    value = math.floor(value + 0.5)
+    if value < 30 then value = 30 end
+    if value > 3600 then value = 3600 end
+    return value
+end
+
+local function normalizedBoolean(selection)
+    local value = trim(selection or "")
+    return value == "true" or value == "1" or value == "on"
+end
+
+local function hotkeyToString(hotkey)
+    if type(hotkey) ~= "table" then return "" end
+    local parts = {}
+    for _, mod in ipairs(hotkey.mods or {}) do
+        table.insert(parts, tostring(mod):lower())
+    end
+    if hotkey.key then
+        table.insert(parts, tostring(hotkey.key):lower())
+    end
+    return table.concat(parts, "+")
+end
+
+local function normalizedHotkey(selection, fallback)
+    local text = trim(selection)
+    if not text or text == "" then
+        return fallback
+    end
+
+    local mods = {}
+    local seenMods = {}
+    local finalKey = nil
+    for rawToken in text:lower():gsub("<", ""):gsub(">", ""):gmatch("[^+]+") do
+        local token = trim(rawToken)
+        if token and token ~= "" then
+            local normalized = token
+            if token == "command" or token == "cmd" or token == "super" or token == "meta" then
+                normalized = "cmd"
+            elseif token == "option" or token == "alt" then
+                normalized = "alt"
+            elseif token == "control" or token == "ctrl" then
+                normalized = "ctrl"
+            elseif token == "shift" then
+                normalized = "shift"
+            end
+
+            if normalized == "cmd" or normalized == "alt" or normalized == "ctrl" or normalized == "shift" then
+                if not seenMods[normalized] then
+                    table.insert(mods, normalized)
+                    seenMods[normalized] = true
+                end
+            else
+                if finalKey then
+                    return nil, "Hotkeys must contain exactly one non-modifier key"
+                end
+                finalKey = normalized
+            end
+        end
+    end
+
+    if not finalKey then
+        return nil, "Hotkeys must include a key"
+    end
+    if #mods == 0 then
+        return nil, "Hotkeys must include at least one modifier"
+    end
+
+    return { mods = mods, key = finalKey:upper() }
 end
 
 local function persistConfigValues(updates)
@@ -1270,9 +1451,36 @@ persistSettings = function(params)
         return false, duckErr
     end
 
+    local timeout, timeoutErr = normalizedTimeout(params.server_idle_timeout)
+    if not timeout then
+        return false, timeoutErr
+    end
+
+    local recordHotkey, recordErr = normalizedHotkey(params.hotkey_toggle_recording, defaults.hotkey_toggle_recording)
+    if not recordHotkey then return false, recordErr end
+    local settingsHotkey, settingsErr = normalizedHotkey(params.hotkey_dictionary_editor, defaults.hotkey_dictionary_editor)
+    if not settingsHotkey then return false, settingsErr end
+    local transcriptsHotkey, transcriptsErr = normalizedHotkey(params.hotkey_open_transcripts, defaults.hotkey_open_transcripts)
+    if not transcriptsHotkey then return false, transcriptsErr end
+    local duckHotkey, duckHotkeyErr = normalizedHotkey(params.hotkey_toggle_ducking, defaults.hotkey_toggle_ducking)
+    if not duckHotkey then return false, duckHotkeyErr end
+
+    local recordingColor = normalizeColorHex(params.border_color_recording, defaults.border_color_recording)
+    local transcribingColor = normalizeColorHex(params.border_color_transcribing, defaults.border_color_transcribing)
+    local completeColor = normalizeColorHex(params.border_color_complete, defaults.border_color_complete)
+
     return persistConfigValues({
         audio_device = normalizedAudioDevice,
+        border_flash_enabled = normalizedBoolean(params.border_flash_enabled),
+        border_color_recording = recordingColor,
+        border_color_transcribing = transcribingColor,
+        border_color_complete = completeColor,
         duck_level = duckLevel,
+        hotkey_toggle_recording = recordHotkey,
+        hotkey_dictionary_editor = settingsHotkey,
+        hotkey_open_transcripts = transcriptsHotkey,
+        hotkey_toggle_ducking = duckHotkey,
+        server_idle_timeout = timeout,
     })
 end
 
@@ -1329,6 +1537,82 @@ local function audioDeviceOptionsJson()
     return hs.json.encode(options)
 end
 
+local function transcriptTimestamp(path)
+    local attrs = hs.fs.attributes(path)
+    if attrs and attrs.modification then return attrs.modification end
+    return 0
+end
+
+local function transcriptTitle(path)
+    local name = path:match("([^/]+)$") or path
+    local stamp, duration = name:match("^transcript_(.-)__dur%-(%d+s)%.txt$")
+    if stamp then
+        return stamp:gsub("_", " ") .. " (" .. duration .. ")"
+    end
+    return name
+end
+
+local function transcriptPreview(path)
+    local content = readFileRaw(path)
+    if not content then return "" end
+    content = content:gsub("%s+", " ")
+    content = trim(content) or ""
+    if #content > 120 then
+        return content:sub(1, 117) .. "..."
+    end
+    return content
+end
+
+local function recentTranscriptsJson()
+    local ok = ensureDirectory(transcriptDir)
+    if not ok then return "[]" end
+
+    local entries = {}
+    for file in hs.fs.dir(transcriptDir) do
+        if file ~= "." and file ~= ".." and file:match("%.txt$") then
+            local path = transcriptDir .. "/" .. file
+            local attrs = hs.fs.attributes(path)
+            if attrs and attrs.mode == "file" then
+                table.insert(entries, {
+                    path = path,
+                    title = transcriptTitle(path),
+                    preview = transcriptPreview(path),
+                    modified = transcriptTimestamp(path),
+                })
+            end
+        end
+    end
+
+    table.sort(entries, function(a, b)
+        return (a.modified or 0) > (b.modified or 0)
+    end)
+    while #entries > 8 do
+        table.remove(entries)
+    end
+    return hs.json.encode(entries)
+end
+
+openPath = function(path, reveal)
+    if type(path) ~= "string" or path == "" then return false end
+    local cmd
+    if reveal then
+        cmd = "/usr/bin/open -R " .. shellQuote(path)
+    else
+        cmd = "/usr/bin/open " .. shellQuote(path)
+    end
+    local _, success = hs.execute(cmd, true)
+    return success
+end
+
+local function escapeHtml(value)
+    return tostring(value or "")
+        :gsub("&", "&amp;")
+        :gsub("<", "&lt;")
+        :gsub(">", "&gt;")
+        :gsub('"', "&quot;")
+        :gsub("'", "&#39;")
+end
+
 local function toggleDictionaryEditor()
     log("toggleDictionaryEditor called")
     local ok, err = pcall(function()
@@ -1338,13 +1622,17 @@ local function toggleDictionaryEditor()
     end
 
     local screen = hs.screen.mainScreen():frame()
-    local w, h = 860, 460
+    local w, h = 1040, 720
     local rect = hs.geometry.rect(screen.x + (screen.w - w) / 2, screen.y + (screen.h - h) / 2, w, h)
 
-    local content = readDictionaryRaw():gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"):gsub("'", "&#39;")
+    local content = escapeHtml(readDictionaryRaw())
     local selectedAudioDevice = selectedAudioDeviceValue(resolveConfiguredAudioInputDevice()) or config.audio_device or ""
-    local escapedSelectedAudioDevice = selectedAudioDevice:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"):gsub("'", "&#39;")
+    local escapedSelectedAudioDevice = escapeHtml(selectedAudioDevice)
     local deviceOptionsJson = audioDeviceOptionsJson()
+    local recentTranscripts = recentTranscriptsJson()
+    local resolvedAudioDevice = configuredAudioDeviceDisplayName() or "System Default"
+    local lastFfmpegInput = lastResolvedAudioDeviceName or "Not resolved yet"
+    local borderEnabledChecked = config.border_flash_enabled and "checked" or ""
 
     local html = [[
 <!DOCTYPE html>
@@ -1366,9 +1654,15 @@ local function toggleDictionaryEditor()
         flex: 1; padding: 12px; display: flex; flex-direction: column; min-height: 0;
     }
     .sidebar {
-        width: 250px; padding: 12px; display: flex; flex-direction: column; gap: 10px;
+        width: 360px; padding: 12px; display: flex; flex-direction: column; gap: 12px;
+        overflow-y: auto;
     }
     h3 { font-size: 13px; margin-bottom: 8px; color: #9da3af; font-weight: 600; }
+    .panel {
+        border-top: 1px solid #383838; padding-top: 12px; display: flex;
+        flex-direction: column; gap: 8px;
+    }
+    .panel:first-child { border-top: none; padding-top: 0; }
     .subtle {
         color: #8b949e; font-size: 12px; line-height: 1.4;
     }
@@ -1378,16 +1672,14 @@ local function toggleDictionaryEditor()
         resize: none; outline: none;
     }
     textarea:focus { border-color: #666; }
-    select {
+    select, input[type="text"], input[type="number"], input[type="color"] {
         width: 100%; background: #2d2d2d; color: #d4d4d4; border: 1px solid #444;
         border-radius: 6px; padding: 8px; font-size: 13px; outline: none;
     }
-    select:focus { border-color: #666; }
-    input[type="number"] {
-        width: 100%; background: #2d2d2d; color: #d4d4d4; border: 1px solid #444;
-        border-radius: 6px; padding: 8px; font-size: 13px; outline: none;
-    }
-    input[type="number"]:focus { border-color: #666; }
+    input[type="color"] { height: 36px; padding: 3px; }
+    select:focus, input:focus { border-color: #666; }
+    .checkbox-row { display: flex; gap: 8px; align-items: center; color: #c9d1d9; font-size: 12px; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .device-note {
         min-height: 38px; background: #1f1f1f; border-radius: 6px; padding: 8px;
         color: #a9b1ba; font-size: 12px; line-height: 1.4;
@@ -1398,6 +1690,18 @@ local function toggleDictionaryEditor()
     .field-label {
         color: #c9d1d9; font-size: 12px; font-weight: 600;
     }
+    .status-list {
+        background: #1f1f1f; border-radius: 6px; padding: 8px; display: grid;
+        gap: 5px; color: #a9b1ba; font-size: 12px; line-height: 1.35;
+    }
+    .status-list strong { color: #d4d4d4; font-weight: 600; }
+    .tool-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .transcript-list { display: flex; flex-direction: column; gap: 8px; }
+    .transcript-item { background: #1f1f1f; border-radius: 6px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+    .transcript-title { color: #d4d4d4; font-size: 12px; font-weight: 600; }
+    .transcript-preview { color: #8b949e; font-size: 12px; line-height: 1.35; }
+    .mini-buttons { display: flex; gap: 6px; }
+    .mini-buttons button, .tool-row button { padding: 5px 9px; font-size: 12px; }
     .buttons { display: flex; gap: 8px; justify-content: flex-end; }
     button {
         padding: 6px 16px; border: none; border-radius: 4px; font-size: 13px; cursor: pointer;
@@ -1416,23 +1720,80 @@ local function toggleDictionaryEditor()
         <textarea id="dict" autofocus>]] .. content .. [[</textarea>
     </div>
     <div class="sidebar">
-        <div>
+        <div class="panel">
             <h3>Input Device</h3>
             <div class="subtle">Choose which microphone Voice Scribe should record from.</div>
+            <select id="audio-device"></select>
+            <div id="device-note" class="device-note"></div>
+            <div class="status-list">
+                <div><strong>Configured:</strong> ]] .. escapeHtml(resolvedAudioDevice) .. [[</div>
+                <div><strong>Resolved by ffmpeg:</strong> ]] .. escapeHtml(lastFfmpegInput) .. [[</div>
+            </div>
         </div>
-        <select id="audio-device"></select>
-        <div id="device-note" class="device-note"></div>
-        <div class="subtle">This sets the app's recording input. It does not need to follow the active Bluetooth device.</div>
-        <div style="height: 6px;"></div>
-        <div>
+        <div class="panel">
             <h3>Ducking</h3>
             <div class="subtle">Set how low Music and Spotify should drop while recording.</div>
+            <div class="field-group">
+                <label class="field-label" for="duck-level">Playback Level While Recording (%)</label>
+                <input id="duck-level" type="number" min="0" max="100" step="1" value="]] .. tostring(config.duck_level or defaults.duck_level) .. [[" />
+            </div>
+            <div id="duck-note" class="device-note"></div>
         </div>
-        <div class="field-group">
-            <label class="field-label" for="duck-level">Playback Level While Recording (%)</label>
-            <input id="duck-level" type="number" min="0" max="100" step="1" value="]] .. tostring(config.duck_level or defaults.duck_level) .. [[" />
+        <div class="panel">
+            <h3>Hotkeys</h3>
+            <div class="grid-2">
+                <div class="field-group">
+                    <label class="field-label" for="hotkey-record">Record</label>
+                    <input id="hotkey-record" type="text" value="]] .. escapeHtml(hotkeyToString(config.hotkey_toggle_recording)) .. [[" />
+                </div>
+                <div class="field-group">
+                    <label class="field-label" for="hotkey-settings">Settings</label>
+                    <input id="hotkey-settings" type="text" value="]] .. escapeHtml(hotkeyToString(config.hotkey_dictionary_editor)) .. [[" />
+                </div>
+                <div class="field-group">
+                    <label class="field-label" for="hotkey-transcripts">Transcripts</label>
+                    <input id="hotkey-transcripts" type="text" value="]] .. escapeHtml(hotkeyToString(config.hotkey_open_transcripts)) .. [[" />
+                </div>
+                <div class="field-group">
+                    <label class="field-label" for="hotkey-duck">Duck</label>
+                    <input id="hotkey-duck" type="text" value="]] .. escapeHtml(hotkeyToString(config.hotkey_toggle_ducking)) .. [[" />
+                </div>
+            </div>
+            <div class="subtle">Use forms like <code>cmd+alt+r</code> or <code>ctrl+shift+s</code>. Reload to apply changed hotkeys.</div>
         </div>
-        <div id="duck-note" class="device-note"></div>
+        <div class="panel">
+            <h3>Border Flash</h3>
+            <label class="checkbox-row"><input id="border-enabled" type="checkbox" ]] .. borderEnabledChecked .. [[ /> Enable status border</label>
+            <div class="grid-2">
+                <div class="field-group">
+                    <label class="field-label" for="color-recording">Recording</label>
+                    <input id="color-recording" type="color" value="]] .. escapeHtml(normalizeColorHex(config.border_color_recording, defaults.border_color_recording)) .. [[" />
+                </div>
+                <div class="field-group">
+                    <label class="field-label" for="color-transcribing">Transcribing</label>
+                    <input id="color-transcribing" type="color" value="]] .. escapeHtml(normalizeColorHex(config.border_color_transcribing, defaults.border_color_transcribing)) .. [[" />
+                </div>
+                <div class="field-group">
+                    <label class="field-label" for="color-complete">Complete</label>
+                    <input id="color-complete" type="color" value="]] .. escapeHtml(normalizeColorHex(config.border_color_complete, defaults.border_color_complete)) .. [[" />
+                </div>
+            </div>
+        </div>
+        <div class="panel">
+            <h3>Daemon</h3>
+            <div class="field-group">
+                <label class="field-label" for="server-timeout">Server Idle Timeout (sec)</label>
+                <input id="server-timeout" type="number" min="30" max="3600" step="30" value="]] .. tostring(config.server_idle_timeout or defaults.server_idle_timeout) .. [[" />
+            </div>
+            <div class="tool-row">
+                <button class="cancel" onclick="openLog()">Open Log</button>
+                <button class="cancel" onclick="reloadApp()">Reload</button>
+            </div>
+        </div>
+        <div class="panel">
+            <h3>Recent Transcripts</h3>
+            <div id="transcript-list" class="transcript-list"></div>
+        </div>
     </div>
 </div>
 <div class="buttons">
@@ -1446,6 +1807,7 @@ local function toggleDictionaryEditor()
     const duckLevelInput = document.getElementById('duck-level');
     const duckNote = document.getElementById('duck-note');
     const selectedAudioDevice = "]] .. escapedSelectedAudioDevice .. [[";
+    const recentTranscripts = ]] .. recentTranscripts .. [[;
 
     for (const option of deviceOptions) {
         const el = document.createElement('option');
@@ -1472,11 +1834,78 @@ local function toggleDictionaryEditor()
     duckLevelInput.addEventListener('input', updateDuckNote);
     updateDuckNote();
 
+    function sendAction(name, params = {}) {
+        const query = new URLSearchParams(params);
+        window.location.href = 'hammerspoon://' + name + (query.toString() ? '?' + query.toString() : '');
+    }
+
+    function openLog() {
+        sendAction('lvs-open-log');
+    }
+
+    function reloadApp() {
+        sendAction('lvs-reload');
+    }
+
+    function renderTranscripts() {
+        const container = document.getElementById('transcript-list');
+        container.innerHTML = '';
+        if (!recentTranscripts.length) {
+            const empty = document.createElement('div');
+            empty.className = 'device-note';
+            empty.textContent = 'No archived transcripts yet.';
+            container.appendChild(empty);
+            return;
+        }
+        for (const transcript of recentTranscripts) {
+            const item = document.createElement('div');
+            item.className = 'transcript-item';
+
+            const title = document.createElement('div');
+            title.className = 'transcript-title';
+            title.textContent = transcript.title || transcript.path;
+            item.appendChild(title);
+
+            const preview = document.createElement('div');
+            preview.className = 'transcript-preview';
+            preview.textContent = transcript.preview || 'Empty transcript';
+            item.appendChild(preview);
+
+            const buttons = document.createElement('div');
+            buttons.className = 'mini-buttons';
+
+            const openButton = document.createElement('button');
+            openButton.className = 'cancel';
+            openButton.textContent = 'Open';
+            openButton.onclick = () => sendAction('lvs-open-transcript', { path: transcript.path });
+            buttons.appendChild(openButton);
+
+            const copyButton = document.createElement('button');
+            copyButton.className = 'cancel';
+            copyButton.textContent = 'Copy';
+            copyButton.onclick = () => sendAction('lvs-copy-transcript', { path: transcript.path });
+            buttons.appendChild(copyButton);
+
+            item.appendChild(buttons);
+            container.appendChild(item);
+        }
+    }
+    renderTranscripts();
+
     function save() {
         const params = new URLSearchParams();
         params.set('data', document.getElementById('dict').value);
         params.set('audio_device', deviceSelect.value);
         params.set('duck_level', duckLevelInput.value);
+        params.set('server_idle_timeout', document.getElementById('server-timeout').value);
+        params.set('hotkey_toggle_recording', document.getElementById('hotkey-record').value);
+        params.set('hotkey_dictionary_editor', document.getElementById('hotkey-settings').value);
+        params.set('hotkey_open_transcripts', document.getElementById('hotkey-transcripts').value);
+        params.set('hotkey_toggle_ducking', document.getElementById('hotkey-duck').value);
+        params.set('border_flash_enabled', document.getElementById('border-enabled').checked ? 'true' : 'false');
+        params.set('border_color_recording', document.getElementById('color-recording').value);
+        params.set('border_color_transcribing', document.getElementById('color-transcribing').value);
+        params.set('border_color_complete', document.getElementById('color-complete').value);
         window.location.href = 'hammerspoon://dict-save?' + params.toString();
     }
     function cancel() {

@@ -1834,9 +1834,13 @@ local function toggleDictionaryEditor()
     duckLevelInput.addEventListener('input', updateDuckNote);
     updateDuckNote();
 
+    function queryString(params) {
+        return new URLSearchParams(params).toString().replace(/\+/g, '%20');
+    }
+
     function sendAction(name, params = {}) {
-        const query = new URLSearchParams(params);
-        window.location.href = 'hammerspoon://' + name + (query.toString() ? '?' + query.toString() : '');
+        const query = queryString(params);
+        window.location.href = 'hammerspoon://' + name + (query ? '?' + query : '');
     }
 
     function openLog() {
@@ -1906,7 +1910,7 @@ local function toggleDictionaryEditor()
         params.set('border_color_recording', document.getElementById('color-recording').value);
         params.set('border_color_transcribing', document.getElementById('color-transcribing').value);
         params.set('border_color_complete', document.getElementById('color-complete').value);
-        window.location.href = 'hammerspoon://dict-save?' + params.toString();
+        window.location.href = 'hammerspoon://dict-save?' + queryString(params);
     }
     function cancel() {
         window.location.href = 'hammerspoon://dict-cancel';

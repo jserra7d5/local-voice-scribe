@@ -262,4 +262,9 @@ class OverlayApp:
         self._signals.quit_signal.emit()
 
     def run(self):
+        # Python runs signal handlers only between bytecodes; an idle Qt loop runs
+        # none, so SIGTERM would wait until systemd's SIGKILL. Wake Python regularly.
+        wake = QTimer()
+        wake.timeout.connect(lambda: None)
+        wake.start(250)
         self._app.exec()

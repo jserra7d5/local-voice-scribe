@@ -1,11 +1,19 @@
 """Audio recording via ffmpeg with PipeWire/PulseAudio backend."""
 
+import array
+import math
 import os
 import signal
 import subprocess
 import threading
 
 from . import config as cfg
+
+# Level tap: a second ffmpeg output, 8 kHz s16 mono on stdout, read in 32 ms chunks.
+LEVEL_RATE = 8000
+LEVEL_CHUNK_BYTES = LEVEL_RATE * 32 // 1000 * 2
+LEVEL_FLOOR_DB = -55.0
+LEVEL_CEIL_DB = -15.0
 
 
 def detect_focusrite() -> str | None:
@@ -64,6 +72,7 @@ class Recorder:
         self.log = log_fn
         self._process: subprocess.Popen | None = None
         self._force_killed = False
+        self.level = 0.0  # 0..1 mic loudness, updated while recording
 
     @property
     def audio_device(self) -> str:
@@ -103,16 +112,22 @@ class Recorder:
             "-ac", "1",
             "-c:a", "pcm_s16le",
             str(cfg.TEMP_AUDIO_FILE),
+            "-ar", str(LEVEL_RATE),
+            "-ac", "1",
+            "-f", "s16le",
+            "-flush_packets", "1",
+            "pipe:1",
         ]
         self.log(f"ffmpeg cmd: {' '.join(cmd)}")
 
         try:
             self._process = subprocess.Popen(
                 cmd,
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
             self.log(f"ffmpeg started pid={self._process.pid}")
+            threading.Thread(target=self._level_reader, args=(self._process,), daemon=True).start()
 
             # Monitor for unexpected crashes
             if on_crash_callback:
@@ -168,6 +183,20 @@ class Recorder:
                 # Still call it but the file size check in transcriber will catch bad files
 
         threading.Thread(target=_wait, daemon=True).start()
+
+    def _level_reader(self, proc: subprocess.Popen):
+        """Turn the level tap into a 0..1 loudness: RMS in dBFS, mapped floor..ceil."""
+        while True:
+            chunk = proc.stdout.read(LEVEL_CHUNK_BYTES)
+            if not chunk:
+                break
+            samples = array.array("h", chunk[: len(chunk) // 2 * 2])
+            if not samples:
+                continue
+            rms = math.sqrt(sum(x * x for x in samples) / len(samples)) / 32768
+            db = 20 * math.log10(rms) if rms > 0 else LEVEL_FLOOR_DB
+            self.level = min(1.0, max(0.0, (db - LEVEL_FLOOR_DB) / (LEVEL_CEIL_DB - LEVEL_FLOOR_DB)))
+        self.level = 0.0
 
     def _crash_monitor(self, proc: subprocess.Popen, callback):
         """Wait for process to exit; if it wasn't stopped intentionally, call crash callback."""

@@ -7,7 +7,8 @@ import sys
 from typing import Callable
 
 from PyQt6.QtCore import QObject, QPointF, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QCursor, QGradient, QLinearGradient, QPainter, QPen, QPolygonF, QRegion
+from PyQt6.QtGui import QColor, QCursor, QScreen, QGradient, QLinearGradient, QPainter, QPen, QPolygonF, QRegion
+from PyQt6.QtDBus import QDBusInterface, QDBusMessage
 from PyQt6.QtWidgets import QApplication, QWidget
 
 from . import config as cfg
@@ -46,6 +47,20 @@ def _build_border_colors(config: dict) -> dict[str, QColor]:
         "transcribing": QColor(config.get("border_color_transcribing", cfg.DEFAULTS["border_color_transcribing"])),
         "complete": QColor(config.get("border_color_complete", cfg.DEFAULTS["border_color_complete"])),
     }
+
+
+def _active_screen() -> QScreen | None:
+    """The screen KWin calls active (it follows the mouse), else a guess from the cursor.
+
+    Under XWayland, Qt sees the pointer only while it is over an X11 window, so
+    QCursor.pos() is often stale and lands on the wrong monitor.
+    """
+    reply = QDBusInterface("org.kde.KWin", "/KWin", "org.kde.KWin").call("activeOutputName")
+    name = reply.arguments()[0] if reply.type() == QDBusMessage.MessageType.ReplyMessage else None
+    for screen in QApplication.screens():
+        if screen.name() == name:
+            return screen
+    return QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
 
 
 class StateSignal(QObject):
@@ -100,7 +115,7 @@ class BorderOverlay(QWidget):
         self._anim_timer.start(ANIM_TICK_MS)
 
     def _show(self, color: QColor):
-        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        screen = _active_screen()
         if not screen:
             return
         self.setGeometry(screen.geometry())

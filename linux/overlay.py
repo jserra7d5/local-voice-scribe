@@ -7,17 +7,28 @@ import sys
 from typing import Callable
 
 from PyQt6.QtCore import QObject, QPointF, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QCursor, QPainter, QPen, QPolygonF, QRegion
+from PyQt6.QtGui import QColor, QCursor, QGradient, QLinearGradient, QPainter, QPen, QPolygonF, QRegion
 from PyQt6.QtWidgets import QApplication, QWidget
 
 from . import config as cfg
 from .settings import SettingsWindow
 
-BORDER_THICKNESS = 6
+ANIM_TICK_MS = 33
+# Bloom (complete): a thick soft glow on all four edges that pulses twice, then fades,
+# so "ready to paste" is hard to miss. Intensity is linear between keyframes.
+BLOOM_KEYS = ((0.0, 0.0), (0.1, 1.0), (0.3, 0.2), (0.45, 1.0), (0.8, 0.5), (1.4, 0.0))  # (s, intensity)
+BLOOM_DEPTH = 34           # px the glow reaches inward
+BLOOM_CORE = 6             # px of solid colour at the edge
+# Shimmer (transcribing): waves of light flow left to right along the top and bottom
+# edges, drawn as a repeating gradient shifted each tick.
+SHIMMER_PERIOD = 900       # px between light crests
+SHIMMER_SPEED = 24         # px per tick
+SHIMMER_BANDS = ((26, 130), (6, 255))  # (height px, crest alpha): faint glow, then bright core
+SHIMMER_FLOOR = 0.15       # alpha between crests, as a fraction of the crest
+
 # Ripple: a neon line on each edge, a standing wave whose axis is the screen edge
 # itself, pinned at the corners. Lobes swing inward; the outward half lies flat on the edge.
 # It replaces the static border while recording; in silence it lies flat on the edges.
-RIPPLE_TICK_MS = 33
 RIPPLE_MAX_DEPTH = 40      # px the line swings inward at full level
 RIPPLE_HALF_WAVE = 800     # px per antinode; each edge fits a whole number of them
 RIPPLE_OMEGA = (0.32, 0.55)  # radians per tick for the two mixed modes
@@ -54,9 +65,7 @@ class BorderOverlay(QWidget):
         self._envelope = 0.0
         self._tick = 0
         self._state = "idle"
-        self._alpha = 230
         self._color = QColor(0, 0, 0, 0)
-        self._fade_step = 0
         self._enabled = True
         self._colors = _build_border_colors(config)
 
@@ -71,15 +80,8 @@ class BorderOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
-        self._fade_timer = QTimer(self)
-        self._fade_timer.timeout.connect(self._fade_tick)
-
-        self._hide_timer = QTimer(self)
-        self._hide_timer.setSingleShot(True)
-        self._hide_timer.timeout.connect(self._clear)
-
-        self._ripple_timer = QTimer(self)
-        self._ripple_timer.timeout.connect(self._ripple_tick)
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._anim_tick)
         self.update_config(config)
 
     def update_config(self, config: dict):
@@ -90,68 +92,48 @@ class BorderOverlay(QWidget):
 
     def set_state(self, state: str):
         self._state = state
-        self._fade_timer.stop()
-        self._stop_ripple()
-        if not self._enabled:
+        self._stop_anim()
+        if not self._enabled or state not in self._colors:
             self._clear()
             return
+        self._show(self._colors[state])
+        self._anim_timer.start(ANIM_TICK_MS)
 
-        if state == "recording":
-            self._show_border(self._colors["recording"], persistent=True)
-            self._ripple_timer.start(RIPPLE_TICK_MS)
-        elif state == "transcribing":
-            self._show_border(self._colors["transcribing"], persistent=False)
-        elif state == "complete":
-            self._show_border(self._colors["complete"], persistent=False)
-        else:
-            self._clear()
-
-    def _show_border(self, color: QColor, persistent: bool):
-        self._hide_timer.stop()
-        self._fade_timer.stop()
-
+    def _show(self, color: QColor):
         screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         if not screen:
             return
-
-        geo = screen.geometry()
-        self.setGeometry(geo)
-
+        self.setGeometry(screen.geometry())
         self._color = QColor(color)
-        self._alpha = 230
-        self._color.setAlpha(self._alpha)
         self.update()
         self.show()
 
-        if not persistent:
-            self._fade_step = 0
-            self._fade_timer.start(50)
+    def _bloom_intensity(self) -> float:
+        elapsed = self._tick * ANIM_TICK_MS / 1000
+        for (t0, v0), (t1, v1) in zip(BLOOM_KEYS, BLOOM_KEYS[1:]):
+            if elapsed <= t1:
+                return v0 + (v1 - v0) * (elapsed - t0) / (t1 - t0)
+        return 0.0
 
-    def _fade_tick(self):
-        self._fade_step += 1
-        total_steps = 11
-        if self._fade_step >= total_steps:
-            self._fade_timer.stop()
-            if self._state == "complete":
-                self._hide_timer.start(200)
-            else:
-                self._clear()
-            return
-        self._alpha = int(230 * (1 - self._fade_step / total_steps))
-        self._color.setAlpha(max(0, self._alpha))
-        self.update()
-
-    def _ripple_tick(self):
-        self._envelope = max(self._level_fn(), self._envelope * RIPPLE_RELEASE)
+    def _anim_tick(self):
+        if self._state == "recording":
+            self._envelope = max(self._level_fn(), self._envelope * RIPPLE_RELEASE)
         self._tick += 1
-        self.update(self._ripple_region())
+        if self._state == "complete" and self._tick * ANIM_TICK_MS / 1000 > BLOOM_KEYS[-1][0]:
+            self._clear()
+            return
+        self.update(self._anim_region())
 
-    def _stop_ripple(self):
-        self._ripple_timer.stop()
+    def _stop_anim(self):
+        self._anim_timer.stop()
         self._envelope = 0.0
+        self._tick = 0
 
-    def _ripple_region(self) -> QRegion:
-        band = BORDER_THICKNESS + RIPPLE_MAX_DEPTH + RIPPLE_GLOW[0][0]
+    def _anim_region(self) -> QRegion:
+        if self._state == "transcribing":
+            h = SHIMMER_BANDS[0][0]
+            return QRegion(0, 0, self.width(), h) | QRegion(0, self.height() - h, self.width(), h)
+        band = BLOOM_DEPTH if self._state == "complete" else RIPPLE_MAX_DEPTH + RIPPLE_GLOW[0][0]
         return QRegion(self.rect()).subtracted(QRegion(self.rect().adjusted(band, band, -band, -band)))
 
     def _neon_lines(self) -> list[QPolygonF]:
@@ -187,28 +169,57 @@ class BorderOverlay(QWidget):
         return lines
 
     def _clear(self):
-        self._stop_ripple()
-        self._fade_timer.stop()
-        self._hide_timer.stop()
+        self._stop_anim()
         self.hide()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        # Wayland window masks control input, not visual clipping. Paint the
-        # border itself and clear the backing buffer so fades do not accumulate.
+        # Clear the backing buffer so animation frames do not accumulate.
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         painter.fillRect(self.rect(), Qt.GlobalColor.transparent)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         if self._state == "recording":
             self._paint_neon(painter)
-        else:
-            t = BORDER_THICKNESS
-            outer = QRegion(self.rect())
-            inner = QRegion(self.rect().adjusted(t, t, -t, -t))
-            painter.setClipRegion(outer.subtracted(inner))
-            painter.fillRect(self.rect(), self._color)
+        elif self._state == "transcribing":
+            self._paint_shimmer(painter)
+        elif self._state == "complete":
+            self._paint_bloom(painter)
         painter.end()
+
+    def _paint_bloom(self, painter: QPainter):
+        intensity = self._bloom_intensity()
+        if intensity <= 0:
+            return
+        w, h, d = self.width(), self.height(), BLOOM_DEPTH
+        edge = QColor(self._color)
+        edge.setAlpha(int(255 * intensity))
+        clear = QColor(self._color)
+        clear.setAlpha(0)
+        # (glow rect, gradient from the edge inward)
+        for rect, (x0, y0, x1, y1) in (
+            ((0, 0, w, d), (0, 0, 0, d)),
+            ((0, h - d, w, d), (0, h, 0, h - d)),
+            ((0, 0, d, h), (0, 0, d, 0)),
+            ((w - d, 0, d, h), (w, 0, w - d, 0)),
+        ):
+            gradient = QLinearGradient(x0, y0, x1, y1)
+            gradient.setColorAt(0.0, edge)
+            gradient.setColorAt(BLOOM_CORE / d, edge)
+            gradient.setColorAt(1.0, clear)
+            painter.fillRect(*rect, gradient)
+
+    def _paint_shimmer(self, painter: QPainter):
+        offset = self._tick * SHIMMER_SPEED
+        for height, crest in SHIMMER_BANDS:
+            gradient = QLinearGradient(offset, 0, offset + SHIMMER_PERIOD, 0)
+            gradient.setSpread(QGradient.Spread.RepeatSpread)
+            for stop, strength in ((0.0, SHIMMER_FLOOR), (0.35, SHIMMER_FLOOR), (0.5, 1.0), (0.65, SHIMMER_FLOOR), (1.0, SHIMMER_FLOOR)):
+                c = QColor(self._color)
+                c.setAlpha(int(crest * strength))
+                gradient.setColorAt(stop, c)
+            painter.fillRect(0, 0, self.width(), height, gradient)
+            painter.fillRect(0, self.height() - height, self.width(), height, gradient)
 
     def _paint_neon(self, painter: QPainter):
         lines = self._neon_lines()

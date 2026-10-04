@@ -78,7 +78,7 @@ class Daemon:
         self.server = WhisperServer(self.config, self.log)
         self.recorder = Recorder(self.config, self.log)
         self.ducking = DuckingController(self.config, self.log)
-        self.hotkeys = HotkeyManager()
+        self.hotkeys = HotkeyManager(self.log)
 
         # Overlay (lazy import — only loaded if PyQt6 available)
         self._overlay = None
@@ -503,13 +503,13 @@ class Daemon:
 
     def _register_hotkeys(self):
         self.hotkeys.stop()
-        self.hotkeys = HotkeyManager()
+        self.hotkeys = HotkeyManager(self.log)
         rec_key = self.config.get("hotkey_toggle_recording", "super+alt+r")
         settings_key = self.config.get("hotkey_open_settings", "super+alt+c")
         trans_key = self.config.get("hotkey_open_transcripts", "super+alt+t")
-        self.hotkeys.register(rec_key, self.toggle_recording)
-        self.hotkeys.register(settings_key, self._open_settings_window)
-        self.hotkeys.register(trans_key, self._open_transcript_folder)
+        self.hotkeys.register("toggle-recording", rec_key, "Toggle recording", self.toggle_recording)
+        self.hotkeys.register("open-settings", settings_key, "Open settings", self._open_settings_window)
+        self.hotkeys.register("open-transcripts", trans_key, "Open transcripts folder", self._open_transcript_folder)
         self.hotkeys.start()
 
     def _copy_transcription_to_clipboard(self, text: str) -> bool:
@@ -527,7 +527,8 @@ class Daemon:
             self.ducking.update_config(self.config)
             if self._overlay:
                 self._overlay.update_config(self.config)
-            self._register_hotkeys()
+            if not self.hotkeys.system_managed:  # portal keys are reassigned in System Settings
+                self._register_hotkeys()
             self.server.reset_idle_timer()
 
     def restart_via_helper(self):

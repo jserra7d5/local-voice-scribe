@@ -1,8 +1,24 @@
-"""Global hotkey manager — X11 via python-xlib XGrabKey, pynput fallback."""
+"""Global hotkey manager.
+
+Wayland: the XDG GlobalShortcuts portal, so the compositor owns and consumes the keys.
+X11: XGrabKey via python-xlib. Last resort: pynput.
+"""
 
 import os
+import secrets
 import threading
 from typing import Callable
+
+APP_ID = "local-voice-scribe"  # must match the installed .desktop file
+
+_USE_PORTAL = False
+if os.environ.get("WAYLAND_DISPLAY"):
+    try:
+        from jeepney import DBusAddress, MatchRule, message_bus, new_method_call
+        from jeepney.io.blocking import Proxy, open_dbus_connection
+        _USE_PORTAL = True
+    except ImportError:
+        pass
 
 # Try X11 native key grabbing first (most reliable on X11)
 _USE_XLIB = False
@@ -88,7 +104,7 @@ class _X11HotkeyManager:
         self._thread: threading.Thread | None = None
         self._running = False
 
-    def register(self, combo: str, action_name: str, callback: Callable):
+    def register(self, combo: str, action_name: str, callback: Callable, description: str = ""):
         mod_mask, key_name = _parse_combo(combo)
         # We'll resolve keycodes in start() when display is open
         self._callbacks[(mod_mask, key_name)] = callback
@@ -170,6 +186,104 @@ class _X11HotkeyManager:
                     time.sleep(0.1)
 
 
+# ─── XDG GlobalShortcuts portal (Wayland) ───
+
+_PORTAL = DBusAddress("/org/freedesktop/portal/desktop", bus_name="org.freedesktop.portal.Desktop",
+                      interface="org.freedesktop.portal.GlobalShortcuts") if _USE_PORTAL else None
+_PORTAL_MODS = {"ctrl": "CTRL", "control": "CTRL", "shift": "SHIFT", "alt": "ALT", "option": "ALT",
+                "super": "LOGO", "win": "LOGO", "cmd": "LOGO", "meta": "LOGO", "windows": "LOGO"}
+
+
+def _portal_trigger(combo: str) -> str:
+    """'super+alt+r' -> 'LOGO+ALT+r', the portal's preferred_trigger format (xkb key names)."""
+    parts = [p.strip() for p in combo.lower().replace("<", "").replace(">", "").split("+") if p.strip()]
+    # Function keys are the one common xkb name that is not lowercase ("F9").
+    return "+".join(_PORTAL_MODS.get(p) or (p.upper() if p[0] == "f" and p[1:].isdigit() else p) for p in parts)
+
+
+class _PortalHotkeyManager:
+    """Global shortcuts through org.freedesktop.portal.GlobalShortcuts.
+
+    The compositor consumes the keys and lists them in its shortcut settings. A
+    combo is only a preferred trigger: it applies on first bind (KDE asks the user
+    to confirm once), and after that the user's assignment in System Settings wins.
+    """
+
+    def __init__(self, log=lambda msg: None):
+        self._log = log
+        self._shortcuts: dict[str, tuple[str, str, Callable]] = {}  # id -> (combo, description, callback)
+        self.bound: dict[str, str] = {}  # id -> trigger description, once bound
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    def register(self, combo: str, action_name: str, callback: Callable, description: str = ""):
+        self._shortcuts[action_name] = (combo, description or action_name, callback)
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _request(self, conn, method: str, signature: str, args: tuple, options: dict) -> dict:
+        """Call a portal method that answers through a Request object; return its results."""
+        token = "lvs" + secrets.token_hex(6)
+        path = f"/org/freedesktop/portal/desktop/request/{conn.unique_name[1:].replace('.', '_')}/{token}"
+        rule = MatchRule(type="signal", interface="org.freedesktop.portal.Request", member="Response", path=path)
+        Proxy(message_bus, conn).AddMatch(rule)
+        with conn.filter(rule) as queue:
+            options = {**options, "handle_token": ("s", token)}
+            conn.send_and_get_reply(new_method_call(_PORTAL, method, signature, (*args, options)))
+            code, results = conn.recv_until_filtered(queue).body  # waits for any user dialog
+        if code != 0:
+            raise RuntimeError(f"{method} answered {code}")
+        return {k: v for k, (_sig, v) in results.items()}
+
+    def _run(self):
+        try:
+            conn = open_dbus_connection(bus="SESSION")
+        except Exception as e:
+            self._log(f"hotkeys: no session bus: {e}")
+            return
+        with conn:
+            try:
+                registry = DBusAddress("/org/freedesktop/portal/desktop", bus_name="org.freedesktop.portal.Desktop",
+                                       interface="org.freedesktop.host.portal.Registry")
+                conn.send_and_get_reply(new_method_call(registry, "Register", "sa{sv}", (APP_ID, {})))
+                session = self._request(conn, "CreateSession", "a{sv}", (),
+                                        {"session_handle_token": ("s", "lvs" + secrets.token_hex(6))})["session_handle"]
+                shortcuts = [(sid, {"description": ("s", desc), "preferred_trigger": ("s", _portal_trigger(combo))})
+                             for sid, (combo, desc, _cb) in self._shortcuts.items()]
+                bound = self._request(conn, "BindShortcuts", "oa(sa{sv})sa{sv}", (session, shortcuts, ""), {})
+                self.bound = {sid: props.get("trigger_description", ("s", ""))[1] for sid, props in bound["shortcuts"]}
+                self._log(f"hotkeys: portal bound {self.bound}")
+            except Exception as e:
+                self._log(f"hotkeys: portal bind failed: {e}")
+                return
+
+            rule = MatchRule(type="signal", interface="org.freedesktop.portal.GlobalShortcuts",
+                             member="Activated", path="/org/freedesktop/portal/desktop")
+            Proxy(message_bus, conn).AddMatch(rule)
+            with conn.filter(rule) as queue:
+                while self._running:
+                    try:
+                        msg = conn.recv_until_filtered(queue, timeout=0.5)
+                    except TimeoutError:
+                        continue
+                    msg_session, sid = msg.body[0], msg.body[1]
+                    entry = self._shortcuts.get(sid)
+                    if msg_session == session and entry:
+                        threading.Thread(target=entry[2], daemon=True).start()
+            close = new_method_call(DBusAddress(session, bus_name="org.freedesktop.portal.Desktop",
+                                                interface="org.freedesktop.portal.Session"), "Close")
+            try:
+                conn.send_and_get_reply(close, timeout=2)
+            except Exception:
+                pass
+
+
 # ─── pynput fallback ───
 
 class _PynputHotkeyManager:
@@ -181,7 +295,7 @@ class _PynputHotkeyManager:
         self._listener = None
         self._lock = threading.Lock()
 
-    def register(self, combo: str, action_name: str, callback: Callable):
+    def register(self, combo: str, action_name: str, callback: Callable, description: str = ""):
         keys = self._parse_combo(combo)
         with self._lock:
             self._hotkeys[frozenset(keys)] = (action_name, callback)
@@ -246,10 +360,13 @@ class _PynputHotkeyManager:
 # ─── Public API ───
 
 class HotkeyManager:
-    """Unified hotkey manager — uses X11 XGrabKey if available, pynput otherwise."""
+    """Unified hotkey manager — portal on Wayland, X11 XGrabKey on X11, pynput otherwise."""
 
-    def __init__(self):
-        if _USE_XLIB:
+    def __init__(self, log=lambda msg: None):
+        if _USE_PORTAL:
+            self._backend = _PortalHotkeyManager(log)
+            self._backend_name = "portal"
+        elif _USE_XLIB:
             self._backend = _X11HotkeyManager()
             self._backend_name = "x11-grab"
         elif _USE_PYNPUT:
@@ -263,10 +380,19 @@ class HotkeyManager:
     def backend_name(self) -> str:
         return self._backend_name
 
-    def register(self, combo: str, callback: Callable):
+    @property
+    def system_managed(self) -> bool:
+        """True when the compositor owns key assignment, so in-app combos are only defaults."""
+        return self._backend_name == "portal"
+
+    @property
+    def bound(self) -> dict[str, str]:
+        """Shortcut id -> the trigger the compositor actually assigned (portal only)."""
+        return getattr(self._backend, "bound", {})
+
+    def register(self, action_id: str, combo: str, description: str, callback: Callable):
         if self._backend:
-            action_name = combo.replace("+", "_")
-            self._backend.register(combo, action_name, callback)
+            self._backend.register(combo, action_id, callback, description)
 
     def start(self):
         if self._backend:

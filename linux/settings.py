@@ -582,10 +582,10 @@ class SettingsWindow(QDialog):
         hotkey_form.addRow("Open transcripts", self.transcripts_hotkey_edit)
         hotkey_layout.addLayout(hotkey_form)
 
-        hint = QLabel("Use forms like `super+alt+r`, `ctrl+shift+s`, or `alt+f8`.")
-        hint.setStyleSheet("color: #8ea2b6; font-size: 12px;")
-        hint.setWordWrap(True)
-        hotkey_layout.addWidget(hint)
+        self.hotkey_hint = QLabel()
+        self.hotkey_hint.setStyleSheet("color: #8ea2b6; font-size: 12px;")
+        self.hotkey_hint.setWordWrap(True)
+        hotkey_layout.addWidget(self.hotkey_hint)
         hotkey_box.setMinimumHeight(220)
         layout.addWidget(hotkey_box)
 
@@ -911,9 +911,20 @@ class SettingsWindow(QDialog):
     def _load_config(self):
         config = dict(self._daemon.config)
         self.idle_timeout_spin.setValue(int(config.get("server_idle_timeout", 300)))
-        self.record_hotkey_edit.setText(config.get("hotkey_toggle_recording", "super+alt+r"))
-        self.settings_hotkey_edit.setText(config.get("hotkey_open_settings", "super+alt+c"))
-        self.transcripts_hotkey_edit.setText(config.get("hotkey_open_transcripts", "super+alt+t"))
+        # On Wayland the compositor owns the keys; show what it bound, read-only.
+        managed = self._daemon.hotkeys.system_managed
+        bound = self._daemon.hotkeys.bound
+        for edit, key, sid, default in (
+            (self.record_hotkey_edit, "hotkey_toggle_recording", "toggle-recording", "super+alt+r"),
+            (self.settings_hotkey_edit, "hotkey_open_settings", "open-settings", "super+alt+c"),
+            (self.transcripts_hotkey_edit, "hotkey_open_transcripts", "open-transcripts", "super+alt+t"),
+        ):
+            edit.setText((bound.get(sid) or "not assigned") if managed else config.get(key, default))
+            edit.setReadOnly(managed)
+        self.hotkey_hint.setText(
+            "Change these in System Settings → Keyboard → Shortcuts → Local Voice Scribe."
+            if managed else "Use forms like `super+alt+r`, `ctrl+shift+s`, or `alt+f8`."
+        )
         self.border_flash_enabled_checkbox.setChecked(bool(config.get("border_flash_enabled", True)))
         self.recording_color_edit.setText(config.get("border_color_recording", cfg.DEFAULTS["border_color_recording"]))
         self.transcribing_color_edit.setText(
@@ -1062,9 +1073,6 @@ class SettingsWindow(QDialog):
             settings = {
                 "server_idle_timeout": int(self.idle_timeout_spin.value()),
                 "audio_device": self.audio_device_combo.currentData(),
-                "hotkey_toggle_recording": _normalize_hotkey(self.record_hotkey_edit.text()),
-                "hotkey_open_settings": _normalize_hotkey(self.settings_hotkey_edit.text()),
-                "hotkey_open_transcripts": _normalize_hotkey(self.transcripts_hotkey_edit.text()),
                 "border_flash_enabled": self.border_flash_enabled_checkbox.isChecked(),
                 "border_color_recording": _normalize_color_hex(
                     self.recording_color_edit.text(), cfg.DEFAULTS["border_color_recording"]
@@ -1086,6 +1094,12 @@ class SettingsWindow(QDialog):
             return
 
         try:
+            if not self._daemon.hotkeys.system_managed:
+                settings.update({
+                    "hotkey_toggle_recording": _normalize_hotkey(self.record_hotkey_edit.text()),
+                    "hotkey_open_settings": _normalize_hotkey(self.settings_hotkey_edit.text()),
+                    "hotkey_open_transcripts": _normalize_hotkey(self.transcripts_hotkey_edit.text()),
+                })
             self._daemon.save_settings(settings)
         except Exception as exc:
             QMessageBox.critical(self, "Save failed", str(exc))

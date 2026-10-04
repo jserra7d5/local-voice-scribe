@@ -32,7 +32,7 @@ The setup script will:
 - check for required system packages (`ffmpeg`, `cmake`, `curl`, `xclip`, `wl-clipboard`, `nvidia-cuda-toolkit`, etc.)
 - download and verify the `ggml-large-v3-turbo` model
 - download and build a pinned `whisper.cpp` release with CUDA support
-- create a Python virtual environment with `pynput` and `PyQt6`
+- create a Python virtual environment with `PyQt6`, `jeepney`, `python-xlib` and `pynput`
 - configure recording through the system default audio input
 - write `~/.local-voice-scribe/runtime.json`
 - create XDG desktop and autostart entries

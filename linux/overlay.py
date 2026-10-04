@@ -260,7 +260,9 @@ class OverlayApp:
 
     def __init__(self, daemon):
         self._daemon = daemon
-        self._app = QApplication.instance() or QApplication(sys.argv)
+        # argv[0] becomes the X11 WM_CLASS, which the taskbar matches to the .desktop file.
+        self._app = QApplication.instance() or QApplication(["local-voice-scribe", *sys.argv[1:]])
+        self._app.setDesktopFileName("local-voice-scribe")  # app id for the desktop portals
         self._app.setQuitOnLastWindowClosed(False)
 
         self._signals = StateSignal()

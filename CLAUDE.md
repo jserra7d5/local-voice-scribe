@@ -80,7 +80,7 @@ ffmpeg MUST be terminated with SIGINT (not SIGKILL/terminate). SIGKILL produces 
 
 The Linux daemon (`linux/`) is a Python package mirroring the macOS init.lua feature set:
 - `daemon.py` — state machine (idle → recording → transcribing → complete → idle) with session IDs
-- `hotkeys.py` — X11 XGrabKey via python-xlib (pynput fallback)
+- `hotkeys.py` — Wayland: XDG GlobalShortcuts portal via jeepney (KDE asks once to confirm; afterwards keys are reassigned in System Settings → Shortcuts, and the settings window shows them read-only). X11: XGrabKey via python-xlib. pynput last
 - `recorder.py` — ffmpeg recording via PulseAudio backend with Focusrite auto-detection
 - `server.py` — whisper-server lifecycle (launch, health check, idle shutdown)
 - `transcriber.py` — HTTP POST to whisper-server `/inference` endpoint
@@ -89,7 +89,7 @@ The Linux daemon (`linux/`) is a Python package mirroring the macOS init.lua fea
 - `clipboard.py` — `wl-copy` on Wayland (data-control, needs no focus), else xclip/xsel; each verified by read-back
 - `config.py`, `notifications.py` — system integration
 
-On Wayland (Plasma 6), Qt runs under XWayland (`__main__.py` sets `QT_QPA_PLATFORM=xcb`): a native Wayland overlay window takes focus when shown, and Qt's own clipboard only works while focused. The X11 hotkey grab needs XWayland too.
+On Wayland (Plasma 6), Qt runs under XWayland (`__main__.py` sets `QT_QPA_PLATFORM=xcb`): a native Wayland overlay window takes focus when shown, and Qt's own clipboard only works while focused. The overlay asks KWin (`activeOutputName` over D-Bus) which screen is active, since XWayland's cursor position is stale. App id for portals and WM_CLASS is `local-voice-scribe`, matching the installed `.desktop` file.
 
 ## State files
 

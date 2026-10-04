@@ -13,7 +13,7 @@ Install/update mode will:
   - install required system packages (ffmpeg, cmake, curl, etc.)
   - download and verify the large-v3-turbo whisper model (~1.6 GB)
   - download and build whisper.cpp with CUDA GPU acceleration
-  - create a Python virtual environment with pynput and PyQt6
+  - create a Python virtual environment with PyQt6, jeepney, python-xlib and pynput
   - configure the system default audio input, with optional device selection later
   - write ~/.local-voice-scribe/runtime.json
   - create desktop launcher and autostart entries
@@ -382,6 +382,7 @@ doctor() {
   [ "$(sha256_file "$runtime_model")" = "$MODEL_SHA256" ] || die "Model checksum mismatch at $runtime_model"
 
   [ -d "$VENV_DIR" ] || die "Python venv missing at $VENV_DIR"
+  "$VENV_DIR/bin/python3" -c "import jeepney" 2>/dev/null || warn "jeepney not installed in venv (no Wayland GlobalShortcuts portal hotkeys)"
   "$VENV_DIR/bin/python3" -c "from Xlib import X" 2>/dev/null || warn "python-xlib not installed in venv (hotkeys will fall back to pynput which may leak keystrokes)"
   "$VENV_DIR/bin/python3" -c "import pynput" 2>/dev/null || warn "pynput not installed in venv (no fallback hotkey backend)"
   "$VENV_DIR/bin/python3" -c "import PyQt6" 2>/dev/null || warn "PyQt6 not installed in venv (border overlay will be disabled)"

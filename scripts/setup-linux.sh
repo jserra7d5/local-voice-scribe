@@ -131,6 +131,7 @@ install_system_packages() {
     [cmake]=cmake
     [curl]=curl
     [xclip]=xclip
+    [wl-copy]=wl-clipboard
     [xdotool]=xdotool
     [notify-send]=libnotify-bin
     [pactl]=pulseaudio-utils

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import threading
 
 from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QPainter, QRegion
@@ -28,7 +27,6 @@ class StateSignal(QObject):
     state_changed = pyqtSignal(str)
     show_settings = pyqtSignal()
     quit_signal = pyqtSignal()
-    clipboard_copy = pyqtSignal(str, object)
 
 
 class BorderOverlay(QWidget):
@@ -47,6 +45,7 @@ class BorderOverlay(QWidget):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput
             | Qt.WindowType.X11BypassWindowManagerHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -94,11 +93,6 @@ class BorderOverlay(QWidget):
         geo = screen.geometry()
         self.setGeometry(geo)
 
-        t = BORDER_THICKNESS
-        outer = QRegion(0, 0, geo.width(), geo.height())
-        inner = QRegion(t, t, geo.width() - 2 * t, geo.height() - 2 * t)
-        self.setMask(outer.subtracted(inner))
-
         self._color = QColor(color)
         self._alpha = 230
         self._color.setAlpha(self._alpha)
@@ -131,12 +125,21 @@ class BorderOverlay(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        # Wayland window masks control input, not visual clipping. Paint the
+        # border itself and clear the backing buffer so fades do not accumulate.
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(self.rect(), Qt.GlobalColor.transparent)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        t = BORDER_THICKNESS
+        outer = QRegion(self.rect())
+        inner = QRegion(self.rect().adjusted(t, t, -t, -t))
+        painter.setClipRegion(outer.subtracted(inner))
         painter.fillRect(self.rect(), self._color)
         painter.end()
 
 
 class OverlayApp:
-    """Manages the Qt application, border overlay, settings window, and clipboard bridge."""
+    """Manages the Qt application, border overlay, and settings window."""
 
     def __init__(self, daemon):
         self._daemon = daemon
@@ -150,22 +153,10 @@ class OverlayApp:
         self._signals.state_changed.connect(self._on_state_changed)
         self._signals.show_settings.connect(self._settings.open_window)
         self._signals.quit_signal.connect(self._app.quit)
-        self._signals.clipboard_copy.connect(self._copy_to_clipboard)
 
     def _on_state_changed(self, state: str):
         self._border.set_state(state)
         self._settings.set_state(state)
-
-    def _copy_to_clipboard(self, text: str, response: object):
-        clipboard = self._app.clipboard()
-        clipboard.setText(text)
-        self._app.processEvents()
-        ok = clipboard.text() == text
-        if isinstance(response, dict):
-            response["ok"] = ok
-            event = response.get("event")
-            if isinstance(event, threading.Event):
-                event.set()
 
     def set_state(self, state: str):
         self._signals.state_changed.emit(state)
@@ -175,12 +166,6 @@ class OverlayApp:
 
     def show_settings_window(self):
         self._signals.show_settings.emit()
-
-    def copy_to_clipboard(self, text: str, timeout_s: float = 1.0) -> bool:
-        response = {"ok": False, "event": threading.Event()}
-        self._signals.clipboard_copy.emit(text, response)
-        response["event"].wait(timeout_s)
-        return bool(response["ok"])
 
     def quit(self):
         self._signals.quit_signal.emit()

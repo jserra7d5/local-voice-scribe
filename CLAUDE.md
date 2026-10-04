@@ -85,8 +85,11 @@ The Linux daemon (`linux/`) is a Python package mirroring the macOS init.lua fea
 - `server.py` — whisper-server lifecycle (launch, health check, idle shutdown)
 - `transcriber.py` — HTTP POST to whisper-server `/inference` endpoint
 - `ducking.py` — per-stream playback ducking via pactl; restores to 100% (see Audio ducking in Features)
-- `overlay.py` — PyQt6 floating recording indicator (red dot) + dictionary editor dialog
-- `config.py`, `clipboard.py`, `notifications.py` — system integration
+- `overlay.py` — PyQt6 screen-border state indicator + settings window
+- `clipboard.py` — `wl-copy` on Wayland (data-control, needs no focus), else xclip/xsel; each verified by read-back
+- `config.py`, `notifications.py` — system integration
+
+On Wayland (Plasma 6), Qt runs under XWayland (`__main__.py` sets `QT_QPA_PLATFORM=xcb`): a native Wayland overlay window takes focus when shown, and Qt's own clipboard only works while focused. The X11 hotkey grab needs XWayland too.
 
 ## State files
 

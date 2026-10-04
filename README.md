@@ -29,7 +29,7 @@ The setup script will:
 
 The setup script will:
 
-- check for required system packages (`ffmpeg`, `cmake`, `curl`, `xclip`, `nvidia-cuda-toolkit`, etc.)
+- check for required system packages (`ffmpeg`, `cmake`, `curl`, `xclip`, `wl-clipboard`, `nvidia-cuda-toolkit`, etc.)
 - download and verify the `ggml-large-v3-turbo` model
 - download and build a pinned `whisper.cpp` release with CUDA support
 - create a Python virtual environment with `pynput` and `PyQt6`

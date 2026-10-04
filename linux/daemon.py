@@ -513,12 +513,6 @@ class Daemon:
         self.hotkeys.start()
 
     def _copy_transcription_to_clipboard(self, text: str) -> bool:
-        if self._overlay:
-            try:
-                if self._overlay.copy_to_clipboard(text):
-                    return True
-            except Exception as e:
-                self.log(f"qt clipboard failed: {e}")
         return copy_to_clipboard(text)
 
     def save_settings(self, updates: dict):

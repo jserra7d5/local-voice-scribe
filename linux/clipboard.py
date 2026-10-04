@@ -1,8 +1,23 @@
-"""Clipboard integration using xclip/xsel with read-back verification."""
+"""Clipboard integration using wl-copy/xclip/xsel with read-back verification."""
 
+import os
 import shutil
 import subprocess
 import time
+
+
+def _verify_with_wl_paste(expected: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["wl-paste", "--no-newline"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+        )
+        return result.stdout == expected
+    except (subprocess.SubprocessError, OSError):
+        return False
 
 
 def _verify_with_xclip(expected: str) -> bool:
@@ -35,7 +50,11 @@ def _verify_with_xsel(expected: str) -> bool:
 
 def copy_to_clipboard(text: str, timeout_s: float = 1.0) -> bool:
     """Copy text to system clipboard. Returns True on success."""
-    candidates = [
+    candidates = []
+    if os.environ.get("WAYLAND_DISPLAY"):
+        # wl-copy uses the data-control protocol, which needs no focused window.
+        candidates.append((["wl-copy"], _verify_with_wl_paste))
+    candidates += [
         (["xclip", "-selection", "clipboard"], _verify_with_xclip),
         (["xsel", "--clipboard", "--input"], _verify_with_xsel),
     ]
